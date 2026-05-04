@@ -25,12 +25,27 @@ import { generateTrialBalance } from '@/lib/reports/trial-balance'
 import { generateARLedger } from '@/lib/reports/ar-ledger'
 import { generateMonthlyBreakdown } from '@/lib/reports/monthly-breakdown'
 import { RECEIPT_MATCHER_HTML } from './widget-html'
+import { dataResources, findResource, parseResourceQuery } from './resources'
+import { getRiskLevel } from '@/lib/pending-operations/risk-tiers'
+import { shouldAutoCommit } from '@/lib/pending-operations/should-auto-commit'
+import { commitPendingOperation } from '@/lib/pending-operations/commit'
+import {
+  checkIdempotencyKey,
+  storeIdempotencyResponse,
+  hashRequest,
+  IdempotencyKeyReuseError,
+} from '@/lib/api/idempotency'
+import { toToolError } from './tool-result'
+import type { PendingOperation } from '@/types'
 import { generateBalanceSheet } from '@/lib/reports/balance-sheet'
 import { generateGeneralLedger } from '@/lib/reports/general-ledger'
 import { generateSupplierLedger } from '@/lib/reports/supplier-ledger'
 import { getReconciliationStatus } from '@/lib/reconciliation/bank-reconciliation'
 import { createInvoicePaymentJournalEntry, createInvoiceCashEntry, createInvoiceJournalEntry } from '@/lib/bookkeeping/invoice-entries'
 import { reverseEntry } from '@/lib/bookkeeping/engine'
+import { closePeriod, lockPeriod } from '@/lib/core/bookkeeping/period-service'
+import { generateSIEExport } from '@/lib/reports/sie-export'
+import { bookkeepingErrorResponse } from '@/lib/bookkeeping/errors'
 import { getSuggestedCategories } from '@/lib/transactions/category-suggestions'
 import { renderToBuffer } from '@react-pdf/renderer'
 import { InvoicePDF } from '@/lib/invoices/pdf-template'
@@ -45,6 +60,14 @@ import { uploadDocument, MAX_DOCUMENT_SIZE } from '@/lib/core/documents/document
 // ensureInitialized() is called by the extension router (ext/[...path]/route.ts)
 // which dispatches to this handler — no duplicate call needed here.
 import type { Transaction, TransactionCategory, EntityType, VatTreatment, Invoice, Currency, CompanySettings, Customer, InvoiceItem } from '@/types'
+
+// ── Actor context ────────────────────────────────────────────
+
+interface ActorContext {
+  type: 'user' | 'api_key' | 'mcp_oauth' | 'cron'
+  id?: string
+  label?: string
+}
 
 // ── JSON-RPC types ───────────────────────────────────────────
 
@@ -81,7 +104,8 @@ interface McpTool {
     args: Record<string, unknown>,
     companyId: string,
     userId: string,
-    supabase: SupabaseClient
+    supabase: SupabaseClient,
+    actor?: ActorContext
   ) => Promise<unknown>
 }
 
@@ -102,6 +126,28 @@ const VALID_VAT_TREATMENTS = [
 
 // ── Pending operations staging ───────────────────────────────
 
+interface StageNextHint {
+  description: string
+  tool?: string
+  args?: Record<string, unknown>
+  resource?: string
+}
+
+interface StageOptions {
+  /**
+   * When true, validate inputs and return the would-be preview without
+   * inserting into pending_operations or executing any side-effects. Used
+   * by agents to preflight an operation before committing to it.
+   */
+  dryRun?: boolean
+  /**
+   * Per-operation idempotency key. When supplied, repeat calls with the same
+   * key + same payload return the original response and never re-execute.
+   * Different payload + same key returns IDEMPOTENCY_KEY_REUSE.
+   */
+  idempotencyKey?: string
+}
+
 async function stagePendingOperation(
   supabase: SupabaseClient,
   companyId: string,
@@ -109,8 +155,75 @@ async function stagePendingOperation(
   operationType: string,
   title: string,
   params: Record<string, unknown>,
-  previewData: Record<string, unknown>
-): Promise<{ staged: true; operation_id: string; message: string; preview: Record<string, unknown> }> {
+  previewData: Record<string, unknown>,
+  actor: ActorContext = { type: 'user' },
+  next?: StageNextHint,
+  options: StageOptions = {}
+): Promise<{
+  staged: boolean
+  dry_run?: boolean
+  idempotency_replay?: boolean
+  operation_id?: string
+  risk_level: 'low' | 'medium' | 'high'
+  actor: ActorContext
+  auto_committed: boolean
+  auto_commit_reason?: string
+  result?: Record<string, unknown>
+  message: string
+  preview: Record<string, unknown>
+  next?: StageNextHint
+}> {
+  const riskLevel = getRiskLevel(operationType)
+  const branding = getBranding().appName.toLowerCase()
+
+  // ── Dry-run path: skip both the cache and the insert. Return the preview
+  //    so the agent sees exactly what would happen without committing.
+  if (options.dryRun) {
+    return {
+      staged: false,
+      dry_run: true,
+      risk_level: riskLevel,
+      actor,
+      auto_committed: false,
+      message: `Dry run: would stage "${operationType}" (risk: ${riskLevel}). No changes made.`,
+      preview: previewData,
+      ...(next ? { next } : {}),
+    }
+  }
+
+  // ── Idempotency check: same key + same payload + same company → return
+  //    cached response. companyId is folded into the canonical hash so the
+  //    same key UUID submitted under a different company is treated as a
+  //    fresh request, not a replay.
+  const requestHash = options.idempotencyKey
+    ? hashRequest({ operationType, params, companyId })
+    : null
+  if (options.idempotencyKey && requestHash) {
+    const cached = await checkIdempotencyKey(supabase, userId, companyId, options.idempotencyKey, requestHash)
+    if (cached) {
+      return {
+        ...(cached.body as Record<string, unknown>),
+        idempotency_replay: true,
+        risk_level: riskLevel,
+        actor,
+        message: `Replayed cached response for idempotency_key "${options.idempotencyKey}". No new side-effects.`,
+        preview: previewData,
+      } as Awaited<ReturnType<typeof stagePendingOperation>>
+    }
+  }
+
+  // Decide auto-commit eligibility BEFORE insert so we can persist the flag.
+  const previewAmount =
+    typeof previewData.amount === 'number' ? previewData.amount as number :
+    typeof previewData.total === 'number' ? previewData.total as number :
+    null
+
+  const decision = await shouldAutoCommit(supabase, companyId, {
+    operationType,
+    actorType: actor.type,
+    amount: previewAmount,
+  })
+
   const { data, error } = await supabase
     .from('pending_operations')
     .insert({
@@ -120,18 +233,78 @@ async function stagePendingOperation(
       title,
       params,
       preview_data: previewData,
+      actor_type: actor.type,
+      actor_id: actor.id ?? null,
+      actor_label: actor.label ?? null,
+      risk_level: riskLevel,
+      auto_commit_eligible: decision.eligible,
     })
-    .select('id')
+    .select('*')
     .single()
 
   if (error) throw new Error(`Failed to stage operation: ${error.message}`)
 
-  return {
+  if (!decision.eligible) {
+    const response = {
+      staged: true,
+      operation_id: data.id,
+      risk_level: riskLevel,
+      actor,
+      auto_committed: false,
+      auto_commit_reason: decision.reason,
+      message: `Operation staged for review (risk: ${riskLevel}). Open the ${branding} web app to approve or reject it.`,
+      preview: previewData,
+      ...(next ? { next } : {}),
+    } as const
+
+    if (options.idempotencyKey && requestHash) {
+      await storeIdempotencyResponse(
+        supabase, userId, companyId, options.idempotencyKey, requestHash,
+        'success', { staged: true, operation_id: data.id, auto_committed: false, preview: previewData }
+      )
+    }
+    return response
+  }
+
+  // Auto-commit path: invoke the dispatcher inline so the same audit
+  // trail/event-emission logic runs as for human approvals.
+  const commitResult = await commitPendingOperation(
+    supabase,
+    userId,
+    companyId,
+    data as PendingOperation,
+    { isAutoCommit: true }
+  )
+
+  const response = {
     staged: true,
     operation_id: data.id,
-    message: `Operation staged for review. Open the ${getBranding().appName.toLowerCase()} web app to approve or reject it.`,
+    risk_level: riskLevel,
+    actor,
+    auto_committed: commitResult.status === 'committed',
+    auto_commit_reason: decision.reason,
+    result: commitResult.data,
+    message: commitResult.status === 'committed'
+      ? `Auto-committed by ${actor.label ?? actor.type} (risk: ${riskLevel}).`
+      : `Auto-commit failed: ${commitResult.error ?? 'unknown'}. Review in the ${branding} web app.`,
     preview: previewData,
+    ...(next ? { next } : {}),
+  } as const
+
+  if (options.idempotencyKey && requestHash) {
+    await storeIdempotencyResponse(
+      supabase, userId, companyId, options.idempotencyKey, requestHash,
+      commitResult.status === 'committed' ? 'success' : 'error',
+      {
+        staged: true,
+        operation_id: data.id,
+        auto_committed: commitResult.status === 'committed',
+        result: commitResult.data,
+        preview: previewData,
+      }
+    )
   }
+  return response
 }
 
 // ── Shared categorization logic ──────────────────────────────
@@ -466,7 +639,7 @@ const tools: McpTool[] = [
       idempotentHint: false,
       openWorldHint: false,
     },
-    async execute(args, companyId, userId, supabase) {
+    async execute(args, companyId, userId, supabase, actor) {
       // Compute the preview (accounts, amounts, VAT lines)
       const result = await categorizeTransactionCore(
         args.transaction_id as string,
@@ -511,7 +684,8 @@ const tools: McpTool[] = [
           currency: result.currency,
           vat_lines: result.vat_lines || [],
           category: result.category,
-        }
+        },
+        actor
       )
     },
   },
@@ -637,16 +811,24 @@ const tools: McpTool[] = [
         postal_code: { type: 'string' },
         city: { type: 'string' },
         country: { type: 'string', description: 'Country (default Sweden)' },
+        dry_run: {
+          type: 'boolean',
+          description: 'If true, validate inputs and return the would-be preview without staging or creating. No DB writes, no side-effects.',
+        },
+        idempotency_key: {
+          type: 'string',
+          description: 'Random per-operation UUID. Repeat calls with the same key + same payload return the original response (24h TTL). Different payload → IDEMPOTENCY_KEY_REUSE error.',
+        },
       },
       required: ['name', 'customer_type'],
     },
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: false,
+      idempotentHint: true, // safe to retry with idempotency_key
       openWorldHint: false,
     },
-    async execute(args, companyId, userId, supabase) {
+    async execute(args, companyId, userId, supabase, actor) {
       const name = args.name as string
       const customerType = args.customer_type as string
 
@@ -671,7 +853,16 @@ const tools: McpTool[] = [
       return stagePendingOperation(supabase, companyId, userId, 'create_customer',
         `Ny kund: ${params.name}`,
         params,
-        params // params ARE the preview for customers
+        params, // params ARE the preview for customers
+        actor,
+        {
+          description: 'Once approved, you can invoice this customer with gnubok_create_invoice using the returned customer_id.',
+          tool: 'gnubok_create_invoice',
+        },
+        {
+          dryRun: Boolean(args.dry_run),
+          idempotencyKey: typeof args.idempotency_key === 'string' ? args.idempotency_key : undefined,
+        }
       )
     },
   },
@@ -805,7 +996,7 @@ const tools: McpTool[] = [
       idempotentHint: false,
       openWorldHint: false,
     },
-    async execute(args, companyId, userId, supabase) {
+    async execute(args, companyId, userId, supabase, actor) {
       const customerId = args.customer_id as string
       const items = args.items as Array<{
         description: string
@@ -898,6 +1089,11 @@ const tools: McpTool[] = [
           vat_treatment: vatRules.treatment,
           invoice_date: invoiceDate,
           due_date: dueDate,
+        },
+        actor,
+        {
+          description: 'Once approved, the invoice is created as a draft. Send it with gnubok_send_invoice or use gnubok_mark_invoice_as_sent if delivered outside the system.',
+          tool: 'gnubok_send_invoice',
         }
       )
     },
@@ -1358,7 +1554,7 @@ const tools: McpTool[] = [
       idempotentHint: false,
       openWorldHint: false,
     },
-    async execute(args, companyId, userId, supabase) {
+    async execute(args, companyId, userId, supabase, actor) {
       const invoiceId = args.invoice_id as string
       if (!invoiceId) throw new Error('invoice_id is required')
 
@@ -1385,7 +1581,8 @@ const tools: McpTool[] = [
           total: invoice.total,
           currency: invoice.currency,
           payment_date: paymentDate,
-        }
+        },
+        actor
       )
     },
   },
@@ -1420,7 +1617,7 @@ const tools: McpTool[] = [
       idempotentHint: false,
       openWorldHint: true,
     },
-    async execute(args, companyId, userId, supabase) {
+    async execute(args, companyId, userId, supabase, actor) {
       const invoiceId = args.invoice_id as string
       if (!invoiceId) throw new Error('invoice_id is required')
 
@@ -1450,7 +1647,8 @@ const tools: McpTool[] = [
           customer_email: customer.email,
           total: invoice.total,
           currency: invoice.currency,
-        }
+        },
+        actor
       )
     },
   },
@@ -1481,7 +1679,7 @@ const tools: McpTool[] = [
       idempotentHint: false,
       openWorldHint: false,
     },
-    async execute(args, companyId, userId, supabase) {
+    async execute(args, companyId, userId, supabase, actor) {
       const invoiceId = args.invoice_id as string
       if (!invoiceId) throw new Error('invoice_id is required')
 
@@ -1503,7 +1701,8 @@ const tools: McpTool[] = [
           customer_name: invoice.customer?.name,
           total: invoice.total,
           currency: invoice.currency,
-        }
+        },
+        actor
       )
     },
   },
@@ -1983,7 +2182,7 @@ const tools: McpTool[] = [
       idempotentHint: false,
       openWorldHint: false,
     },
-    async execute(args, companyId, userId, supabase) {
+    async execute(args, companyId, userId, supabase, actor) {
       const transactionId = args.transaction_id as string
       const invoiceId = args.invoice_id as string
       if (!transactionId || !invoiceId) throw new Error('transaction_id and invoice_id are required')
@@ -2025,7 +2224,8 @@ const tools: McpTool[] = [
           invoice_total: invoice.total,
           invoice_currency: invoice.currency,
           customer_name: (invoice.customer as Record<string, unknown>)?.name as string,
-        }
+        },
+        actor
       )
     },
   },
@@ -2556,6 +2756,729 @@ const tools: McpTool[] = [
       }
     },
   },
+
+  // ── Stream 1 Phase 1: Bookkeeping write (high-risk, always staged) ──
+
+  {
+    name: 'gnubok_close_period',
+    description:
+      'Stage a "close fiscal period" proposal for human approval. Closing a period is irreversible per BFL — it requires the period to already be locked AND the year-end closing entry to be posted.\n\n' +
+      'Args:\n' +
+      '  - fiscal_period_id (string, required): UUID of the fiscal period\n\n' +
+      'Returns: { staged: true, operation_id, risk_level: "high", preview }\n\n' +
+      'High-risk: never auto-committed regardless of trust level. Always requires human approval in the web app.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fiscal_period_id: { type: 'string', description: 'UUID of the fiscal period to close' },
+      },
+      required: ['fiscal_period_id'],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+    async execute(args, companyId, userId, supabase, actor) {
+      const fiscalPeriodId = args.fiscal_period_id as string
+      if (!fiscalPeriodId) throw new Error('fiscal_period_id is required')
+
+      const { data: period, error: fetchError } = await supabase
+        .from('fiscal_periods')
+        .select('id, name, period_start, period_end, is_closed, locked_at, closing_entry_id')
+        .eq('id', fiscalPeriodId)
+        .eq('company_id', companyId)
+        .single()
+
+      if (fetchError || !period) throw new Error('Fiscal period not found')
+      if (period.is_closed) throw new Error('Period is already closed')
+      if (!period.locked_at) throw new Error('Period must be locked before closing — call gnubok_lock_period first')
+      if (!period.closing_entry_id) throw new Error('Year-end closing entry must exist before the period can be closed')
+
+      return stagePendingOperation(supabase, companyId, userId, 'close_period',
+        `Stäng period: ${period.name} (${period.period_start} – ${period.period_end})`,
+        { fiscal_period_id: fiscalPeriodId },
+        {
+          period_name: period.name,
+          period_start: period.period_start,
+          period_end: period.period_end,
+          locked_at: period.locked_at,
+          closing_entry_id: period.closing_entry_id,
+          irreversible: true,
+        },
+        actor,
+        {
+          description: 'Closing is irreversible. Verify the balance sheet and income statement first.',
+          tool: 'gnubok_get_balance_sheet',
+          args: { fiscal_period_id: fiscalPeriodId },
+        }
+      )
+    },
+  },
+
+  {
+    name: 'gnubok_lock_period',
+    description:
+      'Stage a "lock fiscal period" proposal for human approval. Locking prevents new entries from being posted into the period. Requires zero unbooked business transactions.\n\n' +
+      'Args:\n' +
+      '  - fiscal_period_id (string, required): UUID of the fiscal period\n\n' +
+      'Returns: { staged: true, operation_id, risk_level: "high", preview }\n\n' +
+      'High-risk: never auto-committed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fiscal_period_id: { type: 'string', description: 'UUID of the fiscal period to lock' },
+      },
+      required: ['fiscal_period_id'],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+    async execute(args, companyId, userId, supabase, actor) {
+      const fiscalPeriodId = args.fiscal_period_id as string
+      if (!fiscalPeriodId) throw new Error('fiscal_period_id is required')
+
+      const { data: period, error: fetchError } = await supabase
+        .from('fiscal_periods')
+        .select('id, name, period_start, period_end, is_closed, locked_at')
+        .eq('id', fiscalPeriodId)
+        .eq('company_id', companyId)
+        .single()
+
+      if (fetchError || !period) throw new Error('Fiscal period not found')
+      if (period.is_closed) throw new Error('Period is already closed')
+      if (period.locked_at) throw new Error('Period is already locked')
+
+      const { count: unbookedCount } = await supabase
+        .from('transactions')
+        .select('id', { count: 'exact', head: true })
+        .eq('company_id', companyId)
+        .is('journal_entry_id', null)
+        .eq('is_business', true)
+        .gte('date', period.period_start)
+        .lte('date', period.period_end)
+
+      if (unbookedCount && unbookedCount > 0) {
+        throw new Error(
+          `Kan inte låsa period: ${unbookedCount} affärstransaktion(er) saknar bokföring. Bokför alla transaktioner först.`
+        )
+      }
+
+      return stagePendingOperation(supabase, companyId, userId, 'lock_period',
+        `Lås period: ${period.name} (${period.period_start} – ${period.period_end})`,
+        { fiscal_period_id: fiscalPeriodId },
+        {
+          period_name: period.name,
+          period_start: period.period_start,
+          period_end: period.period_end,
+          unbooked_business_transactions: 0,
+        },
+        actor,
+        {
+          description: 'After locking, run year-end closing before the period can be closed via gnubok_close_period. Verify balances first with gnubok_get_trial_balance.',
+          tool: 'gnubok_get_trial_balance',
+          args: { fiscal_period_id: fiscalPeriodId },
+        }
+      )
+    },
+  },
+
+  {
+    name: 'gnubok_uncategorize_transaction',
+    description:
+      'Stage an "uncategorize transaction" proposal for human approval. Reverses the journal entry via storno (legal — never deletes) and clears the transaction\'s category.\n\n' +
+      'Use when a previous categorization needs to be undone before re-categorizing.\n\n' +
+      'Args:\n' +
+      '  - transaction_id (string, required): UUID of the transaction\n\n' +
+      'Returns: { staged: true, operation_id, risk_level: "medium", preview }',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        transaction_id: { type: 'string', description: 'UUID of the transaction to uncategorize' },
+      },
+      required: ['transaction_id'],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+    async execute(args, companyId, userId, supabase, actor) {
+      const transactionId = args.transaction_id as string
+      if (!transactionId) throw new Error('transaction_id is required')
+
+      const { data: tx, error: txError } = await supabase
+        .from('transactions')
+        .select('id, description, merchant_name, amount, currency, date, category, journal_entry_id')
+        .eq('id', transactionId)
+        .eq('company_id', companyId)
+        .single()
+
+      if (txError || !tx) throw new Error('Transaction not found')
+      if (!tx.journal_entry_id) throw new Error('Transaction has no journal entry to reverse')
+
+      const { data: entry } = await supabase
+        .from('journal_entries')
+        .select('id, voucher_number, voucher_series, status')
+        .eq('id', tx.journal_entry_id)
+        .eq('company_id', companyId)
+        .single()
+
+      if (!entry || entry.status !== 'posted') {
+        throw new Error('Linked journal entry is not posted — nothing to reverse')
+      }
+
+      return stagePendingOperation(supabase, companyId, userId, 'uncategorize_transaction',
+        `Återta kategorisering: ${tx.merchant_name || tx.description || transactionId}`,
+        { transaction_id: transactionId, journal_entry_id: tx.journal_entry_id },
+        {
+          transaction_description: tx.merchant_name || tx.description,
+          amount: tx.amount,
+          currency: tx.currency,
+          date: tx.date,
+          current_category: tx.category,
+          will_reverse_voucher: `${entry.voucher_series}${entry.voucher_number}`,
+          method: 'storno (reversal entry, never deletes)',
+        },
+        actor
+      )
+    },
+  },
+
+  {
+    name: 'gnubok_export_sie',
+    description:
+      'Generate a SIE-4 file for the given fiscal period. Returns the SIE content as text — the agent can save it locally or hand it to the user.\n\n' +
+      'SIE-4 is the standard Swedish bookkeeping interchange format (cp437/utf-8). Include this when migrating between systems or handing data to an auditor.\n\n' +
+      'Args:\n' +
+      '  - fiscal_period_id (string, required): UUID of the fiscal period to export\n\n' +
+      'Returns: { content, byte_size, fiscal_period_id, company_name, generated_at }',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fiscal_period_id: { type: 'string', description: 'UUID of the fiscal period to export' },
+      },
+      required: ['fiscal_period_id'],
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    async execute(args, companyId, _userId, supabase) {
+      const fiscalPeriodId = args.fiscal_period_id as string
+      if (!fiscalPeriodId) throw new Error('fiscal_period_id is required')
+
+      const { data: company } = await supabase
+        .from('company_settings')
+        .select('company_name, org_number')
+        .eq('company_id', companyId)
+        .single()
+
+      if (!company) throw new Error('Company settings not found')
+
+      const sieContent = await generateSIEExport(supabase, companyId, {
+        fiscal_period_id: fiscalPeriodId,
+        company_name: company.company_name || 'Unknown',
+        org_number: company.org_number,
+      })
+
+      return {
+        content: sieContent,
+        byte_size: Buffer.byteLength(sieContent, 'utf8'),
+        fiscal_period_id: fiscalPeriodId,
+        company_name: company.company_name,
+        org_number: company.org_number,
+        generated_at: new Date().toISOString(),
+      }
+    },
+  },
+
+  // ── Stream 1 Phase 1 follow-up: year-end, opening balances, revaluation,
+  //    voucher gaps, supplier-invoice lifecycle, proforma conversion ──
+
+  {
+    name: 'gnubok_run_year_end',
+    description:
+      'Stage a year-end closing proposal for human approval. Year-end zeros class 3-8 result accounts into 2099, locks the period, creates the next period, and seeds opening balances. Always high-risk.\n\n' +
+      'Args: fiscal_period_id (required)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fiscal_period_id: { type: 'string', description: 'UUID of the fiscal period to close out' },
+      },
+      required: ['fiscal_period_id'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    async execute(args, companyId, userId, supabase, actor) {
+      const fiscalPeriodId = args.fiscal_period_id as string
+      if (!fiscalPeriodId) throw new Error('fiscal_period_id is required')
+
+      const { data: period } = await supabase
+        .from('fiscal_periods')
+        .select('id, name, period_start, period_end, is_closed, locked_at')
+        .eq('id', fiscalPeriodId).eq('company_id', companyId).single()
+
+      if (!period) throw new Error('Fiscal period not found')
+      if (period.is_closed) throw new Error('Period is already closed')
+
+      return stagePendingOperation(supabase, companyId, userId, 'run_year_end',
+        `Bokslut: ${period.name}`,
+        { fiscal_period_id: fiscalPeriodId },
+        {
+          period_name: period.name,
+          period_start: period.period_start,
+          period_end: period.period_end,
+          will: 'zero result accounts into 2099, lock period, create next period, generate opening balances',
+        },
+        actor,
+        {
+          description: 'After year-end, the period is locked and ready for closing via gnubok_close_period.',
+          tool: 'gnubok_close_period',
+          args: { fiscal_period_id: fiscalPeriodId },
+        }
+      )
+    },
+  },
+
+  {
+    name: 'gnubok_set_opening_balances',
+    description:
+      'Stage an "opening balances" proposal: copy class 1-2 closing balances from a closed period into the next period as opening balances.\n\n' +
+      'Args: closed_period_id, next_period_id (both required)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        closed_period_id: { type: 'string', description: 'UUID of the closed source period' },
+        next_period_id: { type: 'string', description: 'UUID of the next (target) period' },
+      },
+      required: ['closed_period_id', 'next_period_id'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    async execute(args, companyId, userId, supabase, actor) {
+      const closedId = args.closed_period_id as string
+      const nextId = args.next_period_id as string
+      if (!closedId || !nextId) throw new Error('closed_period_id and next_period_id are required')
+
+      return stagePendingOperation(supabase, companyId, userId, 'set_opening_balances',
+        `Ingående balans: ${nextId}`,
+        { closed_period_id: closedId, next_period_id: nextId },
+        { closed_period_id: closedId, next_period_id: nextId, will: 'create opening balance entry from closed-period trial balance' },
+        actor
+      )
+    },
+  },
+
+  {
+    name: 'gnubok_run_currency_revaluation',
+    description:
+      'Stage a currency revaluation: revalue open foreign-currency receivables and payables to the closing-date FX rate. Posts to 3960/7960. Throws if a revaluation already exists for the period.\n\n' +
+      'Args: fiscal_period_id, closing_date (required, YYYY-MM-DD)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fiscal_period_id: { type: 'string', description: 'UUID of the fiscal period' },
+        closing_date: { type: 'string', description: 'Revaluation date (YYYY-MM-DD)' },
+      },
+      required: ['fiscal_period_id', 'closing_date'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    async execute(args, companyId, userId, supabase, actor) {
+      const fiscalPeriodId = args.fiscal_period_id as string
+      const closingDate = args.closing_date as string
+      if (!fiscalPeriodId || !closingDate) throw new Error('fiscal_period_id and closing_date are required')
+
+      return stagePendingOperation(supabase, companyId, userId, 'run_currency_revaluation',
+        `Valutaomvärdering ${closingDate}`,
+        { fiscal_period_id: fiscalPeriodId, closing_date: closingDate },
+        { fiscal_period_id: fiscalPeriodId, closing_date: closingDate, posts_to: ['3960', '7960'] },
+        actor
+      )
+    },
+  },
+
+  {
+    name: 'gnubok_list_voucher_gaps',
+    description:
+      'List voucher number gaps in a fiscal period (BFNAR 2013:2 audit requirement). Each gap may have an existing explanation.\n\n' +
+      'Args: fiscal_period_id (required), voucher_series (optional)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fiscal_period_id: { type: 'string' },
+        voucher_series: { type: 'string', description: 'Optional series filter (e.g. "A")' },
+      },
+      required: ['fiscal_period_id'],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    async execute(args, companyId, _userId, supabase) {
+      const fiscalPeriodId = args.fiscal_period_id as string
+      const voucherSeries = args.voucher_series as string | undefined
+
+      let seriesQuery = supabase
+        .from('voucher_sequences').select('voucher_series')
+        .eq('company_id', companyId).eq('fiscal_period_id', fiscalPeriodId)
+      if (voucherSeries) seriesQuery = seriesQuery.eq('voucher_series', voucherSeries)
+
+      const { data: seriesRows } = await seriesQuery
+      if (!seriesRows || seriesRows.length === 0) {
+        return { gaps: [], total_gaps: 0, unexplained_gaps: 0 }
+      }
+
+      const allGaps: Array<{ series: string; gap_start: number; gap_end: number; explanation: unknown }> = []
+      for (const row of seriesRows) {
+        const { data: gaps } = await supabase.rpc('detect_voucher_gaps', {
+          p_company_id: companyId,
+          p_fiscal_period_id: fiscalPeriodId,
+          p_series: row.voucher_series,
+        })
+        if (gaps) {
+          for (const gap of gaps as Array<{ gap_start: number; gap_end: number }>) {
+            allGaps.push({ series: row.voucher_series, gap_start: gap.gap_start, gap_end: gap.gap_end, explanation: null })
+          }
+        }
+      }
+
+      if (allGaps.length > 0) {
+        const { data: explanations } = await supabase
+          .from('voucher_gap_explanations')
+          .select('id, voucher_series, gap_start, gap_end, explanation, created_at')
+          .eq('company_id', companyId).eq('fiscal_period_id', fiscalPeriodId)
+        if (explanations) {
+          const map = new Map(explanations.map((e) => [`${e.voucher_series}:${e.gap_start}:${e.gap_end}`, e]))
+          for (const g of allGaps) {
+            g.explanation = map.get(`${g.series}:${g.gap_start}:${g.gap_end}`) ?? null
+          }
+        }
+      }
+
+      return {
+        gaps: allGaps,
+        total_gaps: allGaps.length,
+        unexplained_gaps: allGaps.filter((g) => !g.explanation).length,
+      }
+    },
+  },
+
+  {
+    name: 'gnubok_explain_voucher_gap',
+    description:
+      'Stage an explanation for a voucher number gap. Required for BFNAR 2013:2 compliance — every gap must have a documented reason.\n\n' +
+      'Args: fiscal_period_id, voucher_series, gap_start, gap_end, explanation (all required)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fiscal_period_id: { type: 'string' },
+        voucher_series: { type: 'string' },
+        gap_start: { type: 'number' },
+        gap_end: { type: 'number' },
+        explanation: { type: 'string', description: 'Swedish prose: why the gap exists' },
+      },
+      required: ['fiscal_period_id', 'voucher_series', 'gap_start', 'gap_end', 'explanation'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    async execute(args, companyId, userId, supabase, actor) {
+      const explanation = args.explanation as string
+      if (!explanation?.trim()) throw new Error('explanation is required')
+
+      return stagePendingOperation(supabase, companyId, userId, 'explain_voucher_gap',
+        `Förklara verifikationslucka ${args.voucher_series}:${args.gap_start}-${args.gap_end}`,
+        {
+          fiscal_period_id: args.fiscal_period_id,
+          voucher_series: args.voucher_series,
+          gap_start: args.gap_start,
+          gap_end: args.gap_end,
+          explanation: explanation.trim(),
+        },
+        {
+          voucher_series: args.voucher_series,
+          gap_start: args.gap_start,
+          gap_end: args.gap_end,
+          explanation: explanation.trim(),
+        },
+        actor
+      )
+    },
+  },
+
+  {
+    name: 'gnubok_approve_supplier_invoice',
+    description:
+      'Stage approval of a registered supplier invoice. Moves status from "registered" to "approved". High-risk: never auto-committed.\n\n' +
+      'Args: supplier_invoice_id (required)',
+    inputSchema: {
+      type: 'object',
+      properties: { supplier_invoice_id: { type: 'string' } },
+      required: ['supplier_invoice_id'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    async execute(args, companyId, userId, supabase, actor) {
+      const id = args.supplier_invoice_id as string
+      if (!id) throw new Error('supplier_invoice_id is required')
+
+      const { data: inv } = await supabase
+        .from('supplier_invoices')
+        .select('id, supplier_invoice_number, total, currency, status, supplier:suppliers(name)')
+        .eq('id', id).eq('company_id', companyId).single()
+      if (!inv) throw new Error('Supplier invoice not found')
+      if (inv.status !== 'registered') throw new Error('Kan bara godkänna registrerade fakturor')
+
+      return stagePendingOperation(supabase, companyId, userId, 'approve_supplier_invoice',
+        `Godkänn leverantörsfaktura ${inv.supplier_invoice_number}`,
+        { supplier_invoice_id: id },
+        {
+          supplier_invoice_number: inv.supplier_invoice_number,
+          supplier_name: (inv.supplier as { name?: string } | null)?.name,
+          total: inv.total,
+          currency: inv.currency,
+        },
+        actor
+      )
+    },
+  },
+
+  {
+    name: 'gnubok_credit_supplier_invoice',
+    description:
+      'Stage a credit-note (kreditfaktura) for an existing supplier invoice. Creates a mirror invoice with negative effect and reverses the registration JE under accrual method.\n\n' +
+      'Args: supplier_invoice_id (required)',
+    inputSchema: {
+      type: 'object',
+      properties: { supplier_invoice_id: { type: 'string' } },
+      required: ['supplier_invoice_id'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    async execute(args, companyId, userId, supabase, actor) {
+      const id = args.supplier_invoice_id as string
+      if (!id) throw new Error('supplier_invoice_id is required')
+
+      const { data: inv } = await supabase
+        .from('supplier_invoices')
+        .select('id, supplier_invoice_number, total, currency, status, supplier:suppliers(name)')
+        .eq('id', id).eq('company_id', companyId).single()
+      if (!inv) throw new Error('Supplier invoice not found')
+      if (inv.status === 'credited') throw new Error('Fakturan har redan krediterats')
+
+      return stagePendingOperation(supabase, companyId, userId, 'credit_supplier_invoice',
+        `Kreditera leverantörsfaktura ${inv.supplier_invoice_number}`,
+        { supplier_invoice_id: id },
+        {
+          supplier_invoice_number: inv.supplier_invoice_number,
+          supplier_name: (inv.supplier as { name?: string } | null)?.name,
+          total: inv.total,
+          currency: inv.currency,
+          method: 'creates KREDIT- mirror invoice + reverses registration JE (accrual)',
+        },
+        actor
+      )
+    },
+  },
+
+  {
+    name: 'gnubok_convert_invoice',
+    description:
+      'Stage conversion of a proforma invoice to a real invoice. Allocates an F-series number, copies items, marks the proforma cancelled. Medium-risk.\n\n' +
+      'Args: invoice_id (required, must be proforma)',
+    inputSchema: {
+      type: 'object',
+      properties: { invoice_id: { type: 'string' } },
+      required: ['invoice_id'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    async execute(args, companyId, userId, supabase, actor) {
+      const id = args.invoice_id as string
+      if (!id) throw new Error('invoice_id is required')
+
+      const { data: inv } = await supabase
+        .from('invoices')
+        .select('id, document_type, status, total, currency, customer:customers(name)')
+        .eq('id', id).eq('company_id', companyId).single()
+      if (!inv) throw new Error('Invoice not found')
+      if (inv.document_type !== 'proforma') throw new Error('Endast proformafakturor kan konverteras')
+      if (inv.status === 'cancelled') throw new Error('Denna proformafaktura har redan makuleras')
+
+      return stagePendingOperation(supabase, companyId, userId, 'convert_invoice',
+        `Konvertera proforma → faktura`,
+        { invoice_id: id },
+        {
+          customer_name: (inv.customer as { name?: string } | null)?.name,
+          total: inv.total,
+          currency: inv.currency,
+          will: 'allocate F-series number, copy items, cancel proforma',
+        },
+        actor,
+        {
+          description: 'After conversion, send the new invoice with gnubok_send_invoice.',
+          tool: 'gnubok_send_invoice',
+        }
+      )
+    },
+  },
+
+  {
+    name: 'gnubok_unlock_period',
+    description:
+      'Stage an "unlock fiscal period" proposal for human approval. Clears `locked_at` so new entries can be posted into the period. Cannot unlock a closed period — only one that is locked but not closed.\n\n' +
+      'Args: fiscal_period_id (required)\n\n' +
+      'High-risk: never auto-committed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fiscal_period_id: { type: 'string', description: 'UUID of the fiscal period to unlock' },
+      },
+      required: ['fiscal_period_id'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    async execute(args, companyId, userId, supabase, actor) {
+      const fiscalPeriodId = args.fiscal_period_id as string
+      if (!fiscalPeriodId) throw new Error('fiscal_period_id is required')
+
+      const { data: period, error: fetchError } = await supabase
+        .from('fiscal_periods')
+        .select('id, name, period_start, period_end, is_closed, locked_at')
+        .eq('id', fiscalPeriodId)
+        .eq('company_id', companyId)
+        .single()
+
+      if (fetchError || !period) throw new Error('Fiscal period not found')
+      if (period.is_closed) throw new Error('Cannot unlock a closed period')
+      if (!period.locked_at) throw new Error('Period is not locked')
+
+      return stagePendingOperation(supabase, companyId, userId, 'unlock_period',
+        `Lås upp period: ${period.name} (${period.period_start} – ${period.period_end})`,
+        { fiscal_period_id: fiscalPeriodId },
+        {
+          period_name: period.name,
+          period_start: period.period_start,
+          period_end: period.period_end,
+          locked_at: period.locked_at,
+          will: 'clear locked_at — new entries can be posted into the period again',
+        },
+        actor
+      )
+    },
+  },
+
+  {
+    name: 'gnubok_credit_invoice',
+    description:
+      'Stage a credit note (kreditfaktura) for an existing customer invoice. Creates a `KR-` prefixed mirror invoice with negated amounts and reverses the original JE under accrual method. Original must be sent/paid/overdue and not already credited.\n\n' +
+      'Args: invoice_id (required), reason (optional Swedish-language note)\n\n' +
+      'High-risk: never auto-committed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        invoice_id: { type: 'string', description: 'UUID of the invoice to credit' },
+        reason: { type: 'string', description: 'Optional reason note (Swedish, shown on the credit note)' },
+      },
+      required: ['invoice_id'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    async execute(args, companyId, userId, supabase, actor) {
+      const id = args.invoice_id as string
+      const reason = args.reason as string | undefined
+      if (!id) throw new Error('invoice_id is required')
+
+      const { data: inv } = await supabase
+        .from('invoices')
+        .select('id, invoice_number, document_type, status, total, currency, customer:customers(name)')
+        .eq('id', id).eq('company_id', companyId).single()
+
+      if (!inv) throw new Error('Invoice not found')
+      if (inv.document_type && inv.document_type !== 'invoice') {
+        throw new Error('Credit notes can only be created from standard invoices')
+      }
+      if (inv.status === 'credited') throw new Error('Fakturan har redan krediterats')
+      if (!['sent', 'paid', 'overdue'].includes(inv.status)) {
+        throw new Error('Endast skickade, betalda eller förfallna fakturor kan krediteras')
+      }
+
+      return stagePendingOperation(supabase, companyId, userId, 'credit_invoice',
+        `Kreditera faktura ${inv.invoice_number}`,
+        { invoice_id: id, reason },
+        {
+          invoice_number: inv.invoice_number,
+          customer_name: (inv.customer as { name?: string } | null)?.name,
+          total: inv.total,
+          currency: inv.currency,
+          reason: reason || null,
+          method: 'creates KR- mirror invoice + reverses original JE (accrual)',
+        },
+        actor
+      )
+    },
+  },
+
+  {
+    name: 'gnubok_import_sie',
+    description:
+      'Stage a SIE file import proposal for human approval. Parses an SIE file (types 1-4, CP437/UTF-8/Latin-1) and stages a job that, on commit, creates the fiscal period, opening balances, and journal entries.\n\n' +
+      'Args:\n' +
+      '  - file_content (string, required): Full SIE file contents as a string\n' +
+      '  - filename (string, required): Original filename (used for the import record + dedup)\n' +
+      '  - mappings (array, required): Account mappings with { sourceAccount, sourceName, targetAccount, targetName, confidence, matchType, isOverride }. Use gnubok_export_sie or the import wizard to derive these first.\n' +
+      '  - create_fiscal_period (bool, optional, default false)\n' +
+      '  - import_opening_balances (bool, optional, default false)\n' +
+      '  - import_transactions (bool, optional, default false)\n' +
+      '  - voucher_series (string, optional): Override voucher series for imported vouchers\n\n' +
+      'High-risk: never auto-committed. Large file_content payloads are stored on the pending_operation row — keep files reasonable in size.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file_content: { type: 'string', description: 'Full SIE file contents' },
+        filename: { type: 'string', description: 'Original filename' },
+        mappings: {
+          type: 'array',
+          description: 'Account mappings (AccountMapping[])',
+          items: { type: 'object' },
+        },
+        create_fiscal_period: { type: 'boolean' },
+        import_opening_balances: { type: 'boolean' },
+        import_transactions: { type: 'boolean' },
+        voucher_series: { type: 'string' },
+      },
+      required: ['file_content', 'filename', 'mappings'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    async execute(args, companyId, userId, supabase, actor) {
+      const fileContent = args.file_content as string
+      const filename = args.filename as string
+      const mappings = args.mappings as unknown[] | undefined
+
+      if (!fileContent || !filename || !Array.isArray(mappings)) {
+        throw new Error('file_content, filename, and mappings are required')
+      }
+
+      return stagePendingOperation(supabase, companyId, userId, 'import_sie',
+        `SIE-import: ${filename}`,
+        {
+          file_content: fileContent,
+          filename,
+          mappings,
+          create_fiscal_period: Boolean(args.create_fiscal_period),
+          import_opening_balances: Boolean(args.import_opening_balances),
+          import_transactions: Boolean(args.import_transactions),
+          voucher_series: args.voucher_series,
+        },
+        {
+          filename,
+          file_size_bytes: fileContent.length,
+          mappings_count: mappings.length,
+          create_fiscal_period: Boolean(args.create_fiscal_period),
+          import_opening_balances: Boolean(args.import_opening_balances),
+          import_transactions: Boolean(args.import_transactions),
+          will: 'parse SIE on commit, create fiscal period + opening balances + journal entries',
+        },
+        actor
+      )
+    },
+  },
 ]
 
 // ── MCP Protocol Handler ─────────────────────────────────────
@@ -2625,8 +3548,13 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
     })
   }
 
-  const { userId, companyId, scopes: keyScopes } = authResult
+  const { userId, companyId, scopes: keyScopes, apiKeyId, apiKeyName } = authResult
   const supabase = createServiceClientNoCookies()
+  const actor: ActorContext = {
+    type: 'api_key',
+    id: apiKeyId,
+    label: apiKeyName ?? 'Unnamed API key',
+  }
 
   // ── Parse JSON-RPC ──
   let body: JsonRpcRequest
@@ -2708,16 +3636,23 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
         )
       }
 
-      // Enforce scope
+      // Enforce scope — surface structured error so the agent can dispatch.
       const requiredScope = TOOL_SCOPE_MAP[toolName]
       if (requiredScope && !hasScope(keyScopes, requiredScope)) {
+        const scopeError = toToolError(
+          new Error(`Insufficient scope: this API key does not have the "${requiredScope}" scope`),
+          { toolName }
+        )
         return NextResponse.json(
-          jsonRpcError(id ?? null, -32600, `Insufficient scope: this API key does not have the "${requiredScope}" scope`)
+          jsonRpc(id ?? null, {
+            content: [{ type: 'text', text: JSON.stringify(scopeError, null, 2) }],
+            isError: true,
+          })
         )
       }
 
       try {
-        const result = await tool.execute(toolArgs, companyId, userId, supabase)
+        const result = await tool.execute(toolArgs, companyId, userId, supabase, actor)
         const response: Record<string, unknown> = {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
         }
@@ -2726,10 +3661,10 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
         }
         return NextResponse.json(jsonRpc(id ?? null, response))
       } catch (err) {
-        const message = err instanceof Error ? err.message : 'Tool execution failed'
+        const structured = toToolError(err, { toolName })
         return NextResponse.json(
           jsonRpc(id ?? null, {
-            content: [{ type: 'text', text: JSON.stringify({ error: message }) }],
+            content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }],
             isError: true,
           })
         )
@@ -2746,6 +3681,12 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
               description: 'Interactive widget for matching receipts to uncategorized transactions',
               mimeType: 'text/html;profile=mcp-app',
             },
+            ...dataResources.map((r) => ({
+              uri: r.uri,
+              name: r.name,
+              description: r.description,
+              mimeType: r.mimeType,
+            })),
           ],
         })
       )
@@ -2765,6 +3706,36 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
           })
         )
       }
+
+      const dataResource = findResource(uri)
+      if (dataResource) {
+        try {
+          const result = await dataResource.read({
+            supabase,
+            companyId,
+            userId,
+            scopes: keyScopes,
+            query: parseResourceQuery(uri),
+          })
+          return NextResponse.json(
+            jsonRpc(id ?? null, {
+              contents: [
+                {
+                  uri,
+                  mimeType: dataResource.mimeType,
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            })
+          )
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Resource read failed'
+          return NextResponse.json(
+            jsonRpcError(id ?? null, -32603, `Resource read error: ${message}`)
+          )
+        }
+      }
+
       return NextResponse.json(
         jsonRpcError(id ?? null, -32602, `Resource not found: "${uri}"`)
       )

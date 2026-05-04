@@ -1,0 +1,1595 @@
+/**
+ * Unified entry point for executing a pending_operation.
+ *
+ * Used by:
+ *   - The web UI commit route (app/api/pending-operations/[id]/commit/route.ts)
+ *     when a human clicks "Approve"
+ *   - The MCP server (extensions/general/mcp-server/server.ts) when a trusted
+ *     agent stages a low-risk op that the company has opted in to auto-commit
+ *
+ * Both paths converge here so the same audit trail, event emission, error
+ * handling, and status transition logic apply.
+ *
+ * The executor functions previously lived in the commit route. They are kept
+ * private to this module — call `commitPendingOperation()` to invoke them.
+ */
+import type { SupabaseClient } from '@supabase/supabase-js'
+import { eventBus } from '@/lib/events'
+import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
+import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
+import { upsertCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
+import { getVatRules, getAvailableVatRates } from '@/lib/invoices/vat-rules'
+import { fetchExchangeRate, convertToSEK } from '@/lib/currency/riksbanken'
+import { validateVatNumber } from '@/lib/vat/vies-client'
+import {
+  createInvoicePaymentJournalEntry,
+  createInvoiceCashEntry,
+  createInvoiceJournalEntry,
+  createCreditNoteJournalEntry,
+} from '@/lib/bookkeeping/invoice-entries'
+import { reverseEntry } from '@/lib/bookkeeping/engine'
+import { closePeriod, lockPeriod, unlockPeriod } from '@/lib/core/bookkeeping/period-service'
+import {
+  executeYearEndClosing,
+  generateOpeningBalances,
+} from '@/lib/core/bookkeeping/year-end-service'
+import { executeCurrencyRevaluation } from '@/lib/bookkeeping/currency-revaluation'
+import { createSupplierCreditNoteEntry } from '@/lib/bookkeeping/supplier-invoice-entries'
+import { parseSIEFile } from '@/lib/import/sie-parser'
+import { executeSIEImport } from '@/lib/import/sie-import'
+import type { AccountMapping } from '@/lib/import/types'
+import { AccountsNotInChartError, isBookkeepingError } from '@/lib/bookkeeping/errors'
+import { getEmailService } from '@/lib/email/service'
+import {
+  generateInvoiceEmailHtml,
+  generateInvoiceEmailText,
+  generateInvoiceEmailSubject,
+} from '@/lib/email/invoice-templates'
+import { uploadDocument } from '@/lib/core/documents/document-service'
+import { renderToBuffer } from '@react-pdf/renderer'
+import { InvoicePDF } from '@/lib/invoices/pdf-template'
+import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
+import { createLogger } from '@/lib/logger'
+import { appendProcessingHistory } from '@/lib/processing-history/append'
+import type {
+  Transaction,
+  TransactionCategory,
+  EntityType,
+  VatTreatment,
+  Currency,
+  Invoice,
+  Customer,
+  PendingOperation,
+  CompanySettings,
+  InvoiceItem,
+  AccountingMethod,
+  CreditNote,
+} from '@/types'
+
+const log = createLogger('pending-operations/commit')
+
+export interface CommitResult {
+  status: 'committed' | 'rejected' | 'failed'
+  data?: Record<string, unknown>
+  error?: string
+  http_status?: number
+  auto_rejected?: boolean
+}
+
+export interface CommitOptions {
+  /** Email address used as cc on send_invoice (typically the human user's email). */
+  userEmail?: string
+  /**
+   * When true, the op was auto-committed by a trusted agent (no human in the
+   * loop). The status row is updated with `auto_committed_at` so the UI can
+   * surface this on /pending and in audit reports.
+   */
+  isAutoCommit?: boolean
+}
+
+// ── Helper: ensure fiscal period covers the date ──────────────────
+
+async function ensureFiscalPeriod(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  date: string,
+  fiscalYearStartMonth: number = 1
+): Promise<boolean> {
+  const { data: existing } = await supabase
+    .from('fiscal_periods')
+    .select('id')
+    .eq('company_id', companyId)
+    .lte('period_start', date)
+    .gte('period_end', date)
+    .eq('is_closed', false)
+    .limit(1)
+
+  if (existing && existing.length > 0) return true
+
+  const txDate = new Date(date)
+  const txMonth = txDate.getMonth() + 1
+  const txYear = txDate.getFullYear()
+
+  let periodStartYear: number
+  if (fiscalYearStartMonth === 1) {
+    periodStartYear = txYear
+  } else if (txMonth >= fiscalYearStartMonth) {
+    periodStartYear = txYear
+  } else {
+    periodStartYear = txYear - 1
+  }
+
+  const startMonth = String(fiscalYearStartMonth).padStart(2, '0')
+  const periodStart = `${periodStartYear}-${startMonth}-01`
+
+  const endYear = fiscalYearStartMonth === 1 ? periodStartYear : periodStartYear + 1
+  const endMonth = fiscalYearStartMonth === 1 ? 12 : fiscalYearStartMonth - 1
+  const lastDay = new Date(endYear, endMonth, 0).getDate()
+  const periodEnd = `${endYear}-${String(endMonth).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`
+
+  const periodName = fiscalYearStartMonth === 1
+    ? `Räkenskapsår ${periodStartYear}`
+    : `Räkenskapsår ${periodStartYear}/${endYear}`
+
+  const { error } = await supabase
+    .from('fiscal_periods')
+    .upsert({
+      user_id: userId,
+      company_id: companyId,
+      name: periodName,
+      period_start: periodStart,
+      period_end: periodEnd,
+    }, { onConflict: 'user_id,period_start,period_end' })
+
+  if (error) {
+    log.error('Failed to create fiscal period:', error)
+    return false
+  }
+  return true
+}
+
+async function recordSkippedInvoiceJournalEntry(
+  invoiceId: string,
+  companyId: string,
+  userId: string,
+  operation: 'send_invoice' | 'mark_invoice_sent',
+  err: unknown
+): Promise<void> {
+  try {
+    const reasonCode = err instanceof AccountsNotInChartError
+      ? 'accounts_not_in_chart'
+      : 'journal_entry_error'
+    const accountNumbers = err instanceof AccountsNotInChartError ? err.accountNumbers : undefined
+    await appendProcessingHistory({
+      companyId,
+      correlationId: invoiceId,
+      aggregateType: 'System',
+      aggregateId: invoiceId,
+      eventType: 'InvoiceJournalEntrySkipped',
+      payload: {
+        invoice_id: invoiceId,
+        operation,
+        reason_code: reasonCode,
+        ...(accountNumbers ? { account_numbers: accountNumbers } : {}),
+      },
+      actor: { type: 'user', id: userId },
+      occurredAt: new Date(),
+    })
+  } catch (historyErr) {
+    log.warn('Failed to append InvoiceJournalEntrySkipped to processing_history', historyErr)
+  }
+}
+
+// ── Executors ────────────────────────────────────────────────────
+
+type ExecutorResult = { data?: Record<string, unknown>; error?: string; status?: number }
+
+async function commitCategorizeTransaction(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const txId = params.transaction_id as string
+  const category = params.category as TransactionCategory
+  const vatTreatment = params.vat_treatment as VatTreatment | undefined
+
+  const { data: transaction, error: fetchError } = await supabase
+    .from('transactions').select('*').eq('id', txId).eq('company_id', companyId).single()
+
+  if (fetchError || !transaction) {
+    return { error: 'Transaction not found — it may have been deleted.', status: 404 }
+  }
+  if (transaction.journal_entry_id) {
+    return { error: 'Transaction already has a journal entry — it was categorized in the meantime.', status: 409 }
+  }
+
+  const isBusiness = category !== 'private'
+
+  const { data: settings } = await supabase
+    .from('company_settings').select('entity_type, fiscal_year_start_month').eq('company_id', companyId).single()
+
+  const entityType: EntityType = (settings?.entity_type as EntityType) || 'enskild_firma'
+  const fiscalYearStartMonth = settings?.fiscal_year_start_month ?? 1
+
+  const mappingResult = buildMappingResultFromCategory(
+    category, transaction as Transaction, isBusiness, entityType, vatTreatment
+  )
+
+  if (!mappingResult.debit_account || !mappingResult.credit_account) {
+    return { error: `No account mapping for category "${category}" with entity type "${entityType}".`, status: 400 }
+  }
+
+  await ensureFiscalPeriod(supabase, userId, companyId, transaction.date, fiscalYearStartMonth)
+
+  let journalEntryId: string | null = null
+  try {
+    const journalEntry = await createTransactionJournalEntry(
+      supabase, companyId, userId, transaction as Transaction, mappingResult
+    )
+    if (journalEntry) journalEntryId = journalEntry.id
+  } catch (err) {
+    if (isBookkeepingError(err)) throw err
+    log.error('Failed to create journal entry:', err)
+    return { error: err instanceof Error ? err.message : 'Failed to create journal entry', status: 500 }
+  }
+
+  const { error: updateError } = await supabase
+    .from('transactions')
+    .update({ is_business: isBusiness, category, journal_entry_id: journalEntryId })
+    .eq('id', txId)
+
+  if (updateError) {
+    log.error('Failed to update transaction:', updateError)
+    return { error: 'Failed to update transaction', status: 500 }
+  }
+
+  try {
+    await upsertCounterpartyTemplate(
+      supabase, userId, transaction as Transaction, mappingResult, 'user_approved'
+    )
+  } catch { /* non-critical */ }
+
+  await eventBus.emit({
+    type: 'transaction.categorized',
+    payload: {
+      transaction: transaction as Transaction,
+      account: mappingResult.debit_account,
+      taxCode: mappingResult.vat_lines[0]?.account_number || '',
+      userId,
+      companyId,
+    },
+  })
+
+  return { data: { journal_entry_id: journalEntryId, category } }
+}
+
+async function commitCreateCustomer(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const { data, error } = await supabase
+    .from('customers')
+    .insert({
+      user_id: userId,
+      company_id: companyId,
+      name: params.name as string,
+      customer_type: params.customer_type as string,
+      email: (params.email as string) || null,
+      org_number: (params.org_number as string) || null,
+      vat_number: (params.vat_number as string) || null,
+      default_payment_terms: (params.payment_terms as number) || 30,
+      address_line1: (params.address as string) || null,
+      postal_code: (params.postal_code as string) || null,
+      city: (params.city as string) || null,
+      country: (params.country as string) || 'Sweden',
+    })
+    .select()
+    .single()
+
+  if (error) return { error: error.message, status: 500 }
+
+  if (params.customer_type === 'eu_business' && params.vat_number) {
+    try {
+      const vatResult = await validateVatNumber(params.vat_number as string)
+      if (vatResult.valid) {
+        await supabase
+          .from('customers')
+          .update({ vat_number_validated: true, vat_number_validated_at: new Date().toISOString() })
+          .eq('id', data.id)
+          .eq('company_id', companyId)
+      }
+    } catch (err) {
+      log.warn('Auto-VIES validation failed:', err)
+    }
+  }
+
+  await eventBus.emit({ type: 'customer.created', payload: { customer: data as Customer, userId, companyId } })
+
+  return { data: { customer_id: data.id } }
+}
+
+async function commitCreateInvoice(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const customerId = params.customer_id as string
+  const items = params.items as Array<{
+    description: string; quantity: number; unit: string; unit_price: number; vat_rate?: number
+  }>
+
+  const { data: customer, error: customerError } = await supabase
+    .from('customers').select('*').eq('id', customerId).eq('company_id', companyId).single()
+
+  if (customerError || !customer) {
+    return { error: 'Customer not found — they may have been deleted.', status: 404 }
+  }
+
+  const vatRules = getVatRules(customer.customer_type, customer.vat_number_validated)
+  const availableRates = getAvailableVatRates(customer.customer_type, customer.vat_number_validated)
+  const allowedRates = new Set(availableRates.map((r) => r.rate))
+
+  const subtotal = items.reduce((sum, item) => sum + item.quantity * item.unit_price, 0)
+
+  let vatAmount = 0
+  for (const item of items) {
+    const itemRate = item.vat_rate !== undefined ? item.vat_rate : vatRules.rate
+    if (!allowedRates.has(itemRate)) {
+      return { error: `Momssats ${itemRate}% är inte tillåten för denna kundtyp`, status: 400 }
+    }
+    const lineTotal = item.quantity * item.unit_price
+    vatAmount += Math.round(lineTotal * itemRate / 100 * 100) / 100
+  }
+
+  const total = subtotal + vatAmount
+  const currency = ((params.currency as string) || 'SEK') as Currency
+
+  let exchangeRate: number | null = null
+  let exchangeRateDate: string | null = null
+  let subtotalSek: number | null = null
+  let vatAmountSek: number | null = null
+  let totalSek: number | null = null
+
+  if (currency !== 'SEK') {
+    const rateData = await fetchExchangeRate(currency)
+    if (rateData) {
+      exchangeRate = rateData.rate
+      exchangeRateDate = rateData.date
+      subtotalSek = convertToSEK(subtotal, exchangeRate)
+      vatAmountSek = convertToSEK(vatAmount, exchangeRate)
+      totalSek = convertToSEK(total, exchangeRate)
+    }
+  }
+
+  const uniqueRates = new Set(items.map((item) => item.vat_rate ?? vatRules.rate))
+  const isMixedRate = uniqueRates.size > 1
+
+  const { data: invoice, error: invoiceError } = await supabase
+    .from('invoices')
+    .insert({
+      user_id: userId,
+      company_id: companyId,
+      customer_id: customerId,
+      invoice_number: null,
+      invoice_date: (params.invoice_date as string) || new Date().toISOString().split('T')[0],
+      due_date: (params.due_date as string) || null,
+      currency,
+      exchange_rate: exchangeRate,
+      exchange_rate_date: exchangeRateDate,
+      subtotal,
+      subtotal_sek: subtotalSek,
+      vat_amount: vatAmount,
+      vat_amount_sek: vatAmountSek,
+      total,
+      total_sek: totalSek,
+      vat_treatment: vatRules.treatment,
+      vat_rate: isMixedRate ? null : (uniqueRates.values().next().value ?? vatRules.rate),
+      moms_ruta: vatRules.momsRuta,
+      reverse_charge_text: vatRules.reverseChargeText || null,
+      our_reference: (params.our_reference as string) || null,
+      your_reference: (params.your_reference as string) || null,
+      notes: (params.notes as string) || null,
+    })
+    .select()
+    .single()
+
+  if (invoiceError) return { error: invoiceError.message, status: 500 }
+
+  const invoiceItems = items.map((item, index) => {
+    const itemRate = item.vat_rate !== undefined ? item.vat_rate : vatRules.rate
+    const lineTotal = item.quantity * item.unit_price
+    const itemVat = Math.round(lineTotal * itemRate / 100 * 100) / 100
+    return {
+      invoice_id: invoice.id,
+      sort_order: index,
+      description: item.description,
+      quantity: item.quantity,
+      unit: item.unit,
+      unit_price: item.unit_price,
+      line_total: lineTotal,
+      vat_rate: itemRate,
+      vat_amount: itemVat,
+    }
+  })
+
+  const { error: itemsError } = await supabase.from('invoice_items').insert(invoiceItems)
+
+  if (itemsError) {
+    await supabase.from('invoices').delete().eq('id', invoice.id)
+    return { error: itemsError.message, status: 500 }
+  }
+
+  const { data: completeInvoice } = await supabase
+    .from('invoices')
+    .select('*, customer:customers(*), items:invoice_items(*)')
+    .eq('id', invoice.id)
+    .single()
+
+  if (completeInvoice) {
+    await eventBus.emit({
+      type: 'invoice.created',
+      payload: { invoice: completeInvoice as Invoice, userId, companyId },
+    })
+  }
+
+  return { data: { invoice_id: invoice.id, invoice_number: invoice.invoice_number } }
+}
+
+async function commitMarkInvoicePaid(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const invoiceId = params.invoice_id as string
+  const paymentDate = (params.payment_date as string) || new Date().toISOString().split('T')[0]
+
+  const { data: invoice, error: invoiceError } = await supabase
+    .from('invoices')
+    .select('*, customer:customers(*), items:invoice_items(*)')
+    .eq('id', invoiceId)
+    .eq('company_id', companyId)
+    .single()
+
+  if (invoiceError || !invoice) return { error: 'Invoice not found', status: 404 }
+  if (invoice.status !== 'sent' && invoice.status !== 'overdue') {
+    return { error: 'Invoice can only be marked as paid when status is "sent" or "overdue"', status: 409 }
+  }
+
+  const { data: settings } = await supabase
+    .from('company_settings').select('accounting_method, entity_type').eq('company_id', companyId).single()
+
+  const accountingMethod = settings?.accounting_method || 'accrual'
+  const entityType = (settings?.entity_type as EntityType) || 'enskild_firma'
+  const isRealInvoice = !invoice.document_type || invoice.document_type === 'invoice'
+  let journalEntryId: string | null = null
+
+  if (isRealInvoice) {
+    if (accountingMethod === 'accrual') {
+      const je = await createInvoicePaymentJournalEntry(
+        supabase, companyId, userId, invoice as Invoice, paymentDate, undefined, invoice.customer?.name
+      )
+      journalEntryId = je?.id ?? null
+    } else {
+      const je = await createInvoiceCashEntry(
+        supabase, companyId, userId, invoice as Invoice, paymentDate, entityType, invoice.customer?.name
+      )
+      journalEntryId = je?.id ?? null
+    }
+  }
+
+  const now = new Date().toISOString()
+  const { error: updateError } = await supabase
+    .from('invoices')
+    .update({ status: 'paid', paid_at: now, paid_amount: invoice.total })
+    .eq('id', invoiceId)
+    .eq('company_id', companyId)
+
+  if (updateError) return { error: 'Failed to update invoice status', status: 500 }
+
+  return { data: { status: 'paid', journal_entry_id: journalEntryId } }
+}
+
+async function commitSendInvoice(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>,
+  userEmail?: string
+): Promise<ExecutorResult> {
+  const invoiceId = params.invoice_id as string
+
+  const emailService = getEmailService()
+  if (!emailService.isConfigured()) {
+    return { error: 'Email service not configured', status: 500 }
+  }
+
+  const { data: invoice, error: invoiceError } = await supabase
+    .from('invoices')
+    .select('*, customer:customers(*), items:invoice_items(*)')
+    .eq('id', invoiceId)
+    .eq('company_id', companyId)
+    .single()
+
+  if (invoiceError || !invoice) return { error: 'Invoice not found', status: 404 }
+  if (invoice.status === 'sent' || invoice.status === 'paid' || invoice.status === 'overdue') {
+    return { error: 'Invoice has already been sent', status: 409 }
+  }
+
+  const customer = invoice.customer as Customer
+  if (!customer.email) return { error: 'Customer has no email address', status: 400 }
+
+  const { data: company, error: companyError } = await supabase
+    .from('company_settings').select('*').eq('company_id', companyId).single()
+
+  if (companyError || !company) return { error: 'Company settings missing', status: 500 }
+
+  try {
+    await ensureInvoiceNumber(supabase, companyId, invoice as Invoice)
+  } catch (err) {
+    return { error: `Failed to assign invoice number: ${err instanceof Error ? err.message : 'unknown'}`, status: 500 }
+  }
+
+  const items = (invoice.items as InvoiceItem[]).sort(
+    (a: InvoiceItem, b: InvoiceItem) => a.sort_order - b.sort_order
+  )
+
+  let originalInvoiceNumber: string | undefined
+  if (invoice.credited_invoice_id) {
+    const { data: orig } = await supabase
+      .from('invoices').select('invoice_number').eq('id', invoice.credited_invoice_id).single()
+    if (orig) originalInvoiceNumber = orig.invoice_number
+  }
+
+  const pdfBuffer = await renderToBuffer(
+    InvoicePDF({
+      invoice: invoice as Invoice,
+      customer,
+      items,
+      company: company as CompanySettings,
+      originalInvoiceNumber,
+    })
+  )
+
+  const isCreditNote = !!invoice.credited_invoice_id
+  const docType = invoice.document_type || 'invoice'
+  let filename: string
+  if (isCreditNote) filename = `kreditfaktura-${invoice.invoice_number}.pdf`
+  else if (docType === 'proforma') filename = `proformafaktura-${invoice.invoice_number}.pdf`
+  else if (docType === 'delivery_note') filename = `foljesedel-${invoice.invoice_number}.pdf`
+  else filename = `faktura-${invoice.invoice_number}.pdf`
+
+  const ccAddress = company.email || userEmail
+  const emailData = { invoice: invoice as Invoice, customer, company: company as CompanySettings }
+  const result = await emailService.sendEmail({
+    to: customer.email,
+    cc: ccAddress,
+    subject: generateInvoiceEmailSubject(emailData),
+    html: generateInvoiceEmailHtml(emailData),
+    text: generateInvoiceEmailText(emailData),
+    replyTo: company.email || undefined,
+    fromName: company.trade_name || company.company_name,
+    attachments: [{ filename, content: pdfBuffer, contentType: 'application/pdf' }],
+  })
+
+  if (!result.success) return { error: `Failed to send email: ${result.error}`, status: 500 }
+
+  await supabase.from('invoices').update({ status: 'sent' }).eq('id', invoiceId).eq('company_id', companyId)
+
+  const isRealInvoice = !invoice.document_type || invoice.document_type === 'invoice'
+  let createdJournalEntryId: string | undefined
+  if (isRealInvoice && (company.accounting_method === 'accrual' || !company.accounting_method)) {
+    try {
+      const je = await createInvoiceJournalEntry(
+        supabase, companyId, userId, invoice as Invoice, (company as CompanySettings).entity_type
+      )
+      if (je) {
+        createdJournalEntryId = je.id
+        await supabase.from('invoices').update({ journal_entry_id: je.id }).eq('id', invoiceId)
+      }
+    } catch (err) {
+      await recordSkippedInvoiceJournalEntry(invoiceId, companyId, userId, 'send_invoice', err)
+    }
+  }
+
+  if (isRealInvoice) {
+    try {
+      const pdfArrayBuffer = new Uint8Array(pdfBuffer).buffer as ArrayBuffer
+      await uploadDocument(supabase, userId, companyId, {
+        name: filename, buffer: pdfArrayBuffer, type: 'application/pdf',
+      }, { upload_source: 'system', journal_entry_id: createdJournalEntryId })
+    } catch { /* non-blocking */ }
+  }
+
+  await eventBus.emit({ type: 'invoice.sent', payload: { invoice: invoice as Invoice, userId, companyId } })
+
+  return { data: { message: `Invoice ${invoice.invoice_number} sent to ${customer.email}` } }
+}
+
+async function commitMarkInvoiceSent(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const invoiceId = params.invoice_id as string
+
+  const { data: invoice, error: invoiceError } = await supabase
+    .from('invoices')
+    .select('*, customer:customers(*), items:invoice_items(*)')
+    .eq('id', invoiceId)
+    .eq('company_id', companyId)
+    .single()
+
+  if (invoiceError || !invoice) return { error: 'Invoice not found', status: 404 }
+  if (invoice.status !== 'draft') return { error: 'Only draft invoices can be marked as sent', status: 409 }
+
+  try {
+    await ensureInvoiceNumber(supabase, companyId, invoice as Invoice)
+  } catch (err) {
+    return { error: `Failed to assign invoice number: ${err instanceof Error ? err.message : 'unknown'}`, status: 500 }
+  }
+
+  const { error: updateError } = await supabase
+    .from('invoices').update({ status: 'sent' }).eq('id', invoiceId).eq('company_id', companyId)
+
+  if (updateError) return { error: 'Failed to update invoice status', status: 500 }
+
+  const { data: settings } = await supabase
+    .from('company_settings').select('accounting_method, entity_type').eq('company_id', companyId).single()
+
+  const isRealInvoice = !invoice.document_type || invoice.document_type === 'invoice'
+  let journalEntryId: string | null = null
+
+  if (isRealInvoice && (settings?.accounting_method === 'accrual' || !settings?.accounting_method)) {
+    try {
+      const je = await createInvoiceJournalEntry(
+        supabase, companyId, userId, invoice as Invoice,
+        (settings?.entity_type as EntityType) || 'enskild_firma',
+        invoice.customer?.name
+      )
+      if (je) {
+        journalEntryId = je.id
+        await supabase.from('invoices').update({ journal_entry_id: je.id }).eq('id', invoiceId)
+      }
+    } catch (err) {
+      await recordSkippedInvoiceJournalEntry(invoiceId, companyId, userId, 'mark_invoice_sent', err)
+    }
+  }
+
+  return { data: { status: 'sent', journal_entry_id: journalEntryId } }
+}
+
+async function commitMatchTransactionInvoice(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const transactionId = params.transaction_id as string
+  const invoiceId = params.invoice_id as string
+
+  const { data: transaction, error: txError } = await supabase
+    .from('transactions').select('*').eq('id', transactionId).eq('company_id', companyId).single()
+
+  if (txError || !transaction) return { error: 'Transaction not found', status: 404 }
+  if (transaction.amount <= 0) return { error: 'Only income transactions can be matched', status: 400 }
+  if (transaction.invoice_id) return { error: 'Transaction already linked to an invoice', status: 409 }
+
+  const { data: invoice, error: invError } = await supabase
+    .from('invoices')
+    .select('*, customer:customers(*), items:invoice_items(*)')
+    .eq('id', invoiceId)
+    .eq('company_id', companyId)
+    .single()
+
+  if (invError || !invoice) return { error: 'Invoice not found', status: 404 }
+  if (!['sent', 'overdue', 'partially_paid'].includes(invoice.status)) {
+    return { error: 'Invoice is not in a matchable state', status: 409 }
+  }
+
+  if (transaction.journal_entry_id) {
+    await reverseEntry(supabase, companyId, userId, transaction.journal_entry_id)
+    await supabase.from('transactions').update({ journal_entry_id: null }).eq('id', transactionId)
+  }
+
+  const now = new Date().toISOString()
+  const paidAmount = transaction.amount
+  const newPaidAmount = Math.round(((invoice.paid_amount || 0) + paidAmount) * 100) / 100
+  const currentRemaining = invoice.remaining_amount ?? (invoice.total - (invoice.paid_amount || 0))
+  const newRemaining = Math.max(0, Math.round((currentRemaining - paidAmount) * 100) / 100)
+  const isFullyPaid = newRemaining <= 0
+  const newStatus = isFullyPaid ? 'paid' : 'partially_paid'
+
+  const { data: settings } = await supabase
+    .from('company_settings').select('accounting_method, entity_type').eq('company_id', companyId).single()
+
+  const accountingMethod = settings?.accounting_method || 'accrual'
+  const entityType = (settings?.entity_type as EntityType) || 'enskild_firma'
+
+  let journalEntryId: string | null = null
+  try {
+    if (accountingMethod === 'cash' && isFullyPaid) {
+      const je = await createInvoiceCashEntry(
+        supabase, companyId, userId, invoice as Invoice, transaction.date, entityType, invoice.customer?.name
+      )
+      journalEntryId = je?.id ?? null
+    } else {
+      const je = await createInvoicePaymentJournalEntry(
+        supabase, companyId, userId, invoice as Invoice, transaction.date, undefined, invoice.customer?.name, paidAmount
+      )
+      journalEntryId = je?.id ?? null
+    }
+  } catch (err) {
+    if (isBookkeepingError(err)) throw err
+    log.error('Failed to create match journal entry:', err)
+  }
+
+  const { data: updatedRows, error: updateInvError } = await supabase
+    .from('invoices')
+    .update({
+      status: newStatus,
+      paid_at: isFullyPaid ? now : null,
+      paid_amount: newPaidAmount,
+      remaining_amount: newRemaining,
+    })
+    .eq('id', invoiceId)
+    .in('status', ['sent', 'overdue', 'partially_paid'])
+    .select('id')
+
+  if (updateInvError) return { error: 'Failed to update invoice status', status: 500 }
+  if (!updatedRows || updatedRows.length === 0) {
+    return { error: 'Invoice has already been fully paid or is no longer matchable', status: 409 }
+  }
+
+  const paymentNotes = (accountingMethod === 'cash' && !isFullyPaid)
+    ? 'Kontantmetoden: intäkt bokförs vid slutbetalning' : null
+
+  await supabase.from('invoice_payments').insert({
+    user_id: userId,
+    company_id: companyId,
+    invoice_id: invoiceId,
+    payment_date: transaction.date,
+    amount: paidAmount,
+    currency: invoice.currency,
+    exchange_rate: invoice.exchange_rate,
+    journal_entry_id: journalEntryId,
+    transaction_id: transactionId,
+    notes: paymentNotes,
+  })
+
+  await supabase
+    .from('transactions')
+    .update({
+      invoice_id: invoiceId,
+      potential_invoice_id: null,
+      journal_entry_id: journalEntryId,
+      is_business: true,
+      category: 'income_services',
+    })
+    .eq('id', transactionId)
+
+  try {
+    await eventBus.emit({
+      type: 'invoice.match_confirmed',
+      payload: { invoice: invoice as Invoice, transaction: transaction as Transaction, userId, companyId },
+    })
+  } catch { /* non-critical */ }
+
+  return { data: { invoice_status: newStatus, paid_amount: newPaidAmount, journal_entry_id: journalEntryId } }
+}
+
+// ── Stream 1 Phase 1 + follow-up executors ───────────────────────
+
+async function commitClosePeriod(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const id = params.fiscal_period_id as string
+  if (!id) return { error: 'fiscal_period_id is required', status: 400 }
+  try {
+    const period = await closePeriod(supabase, companyId, userId, id)
+    return { data: { period_id: period.id, closed_at: period.closed_at } }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : 'Close failed', status: 400 }
+  }
+}
+
+async function commitLockPeriod(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const id = params.fiscal_period_id as string
+  if (!id) return { error: 'fiscal_period_id is required', status: 400 }
+  try {
+    const period = await lockPeriod(supabase, companyId, userId, id)
+    return { data: { period_id: period.id, locked_at: period.locked_at } }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : 'Lock failed', status: 400 }
+  }
+}
+
+async function commitUnlockPeriod(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const id = params.fiscal_period_id as string
+  if (!id) return { error: 'fiscal_period_id is required', status: 400 }
+  try {
+    const period = await unlockPeriod(supabase, companyId, userId, id)
+    return { data: { period_id: period.id, locked_at: period.locked_at } }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : 'Unlock failed', status: 400 }
+  }
+}
+
+async function commitUncategorizeTransaction(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const txId = params.transaction_id as string
+  const journalEntryId = params.journal_entry_id as string
+  if (!txId || !journalEntryId) return { error: 'transaction_id and journal_entry_id are required', status: 400 }
+
+  try {
+    await reverseEntry(supabase, companyId, userId, journalEntryId)
+  } catch (err) {
+    if (isBookkeepingError(err)) throw err
+    return { error: err instanceof Error ? err.message : 'Reversal failed', status: 500 }
+  }
+
+  const { error: updateError } = await supabase
+    .from('transactions')
+    .update({ is_business: null, category: null, journal_entry_id: null })
+    .eq('id', txId)
+    .eq('company_id', companyId)
+
+  if (updateError) return { error: 'Failed to reset transaction', status: 500 }
+
+  return { data: { transaction_id: txId, reversed_journal_entry_id: journalEntryId } }
+}
+
+async function commitRunYearEnd(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const id = params.fiscal_period_id as string
+  if (!id) return { error: 'fiscal_period_id is required', status: 400 }
+
+  try {
+    const result = await executeYearEndClosing(supabase, companyId, userId, id)
+    return {
+      data: {
+        closing_entry_id: result.closingEntry?.id ?? null,
+        next_period_id: result.nextPeriod?.id ?? null,
+        opening_balance_entry_id: result.openingBalanceEntry?.id ?? null,
+      },
+    }
+  } catch (err) {
+    if (isBookkeepingError(err)) throw err
+    return { error: err instanceof Error ? err.message : 'Year-end failed', status: 400 }
+  }
+}
+
+async function commitSetOpeningBalances(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const closedId = params.closed_period_id as string
+  const nextId = params.next_period_id as string
+  if (!closedId || !nextId) return { error: 'closed_period_id and next_period_id are required', status: 400 }
+
+  try {
+    const entry = await generateOpeningBalances(supabase, companyId, userId, closedId, nextId)
+    return { data: { opening_balance_entry_id: entry.id } }
+  } catch (err) {
+    if (isBookkeepingError(err)) throw err
+    return { error: err instanceof Error ? err.message : 'Opening balances failed', status: 400 }
+  }
+}
+
+async function commitRunCurrencyRevaluation(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const id = params.fiscal_period_id as string
+  const closingDate = params.closing_date as string
+  if (!id || !closingDate) return { error: 'fiscal_period_id and closing_date are required', status: 400 }
+
+  try {
+    const result = await executeCurrencyRevaluation(supabase, companyId, closingDate, id, userId)
+    return {
+      data: result
+        ? { entry_id: result.entry.id, items_revalued: result.preview.items.length }
+        : { entry_id: null, items_revalued: 0, message: 'No foreign-currency items to revalue' },
+    }
+  } catch (err) {
+    if (isBookkeepingError(err)) throw err
+    return { error: err instanceof Error ? err.message : 'Revaluation failed', status: 400 }
+  }
+}
+
+async function commitExplainVoucherGap(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const fiscalPeriodId = params.fiscal_period_id as string
+  const voucherSeries = params.voucher_series as string
+  const gapStart = Number(params.gap_start)
+  const gapEnd = Number(params.gap_end)
+  const explanation = params.explanation as string
+  if (!fiscalPeriodId || !voucherSeries || !gapStart || !gapEnd || !explanation?.trim()) {
+    return { error: 'fiscal_period_id, voucher_series, gap_start, gap_end, and explanation are required', status: 400 }
+  }
+
+  const { data, error } = await supabase
+    .from('voucher_gap_explanations')
+    .insert({
+      user_id: userId,
+      company_id: companyId,
+      fiscal_period_id: fiscalPeriodId,
+      voucher_series: voucherSeries,
+      gap_start: gapStart,
+      gap_end: gapEnd,
+      explanation: explanation.trim(),
+    })
+    .select('id')
+    .single()
+
+  if (error) return { error: error.message, status: 500 }
+  return { data: { explanation_id: data.id } }
+}
+
+async function commitApproveSupplierInvoice(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const id = params.supplier_invoice_id as string
+  if (!id) return { error: 'supplier_invoice_id is required', status: 400 }
+
+  const { data: invoice } = await supabase
+    .from('supplier_invoices').select('*').eq('id', id).eq('company_id', companyId).single()
+
+  if (!invoice) return { error: 'Supplier invoice not found', status: 404 }
+  if (invoice.status !== 'registered') {
+    return { error: 'Kan bara godkänna registrerade fakturor', status: 400 }
+  }
+
+  const { data, error } = await supabase
+    .from('supplier_invoices')
+    .update({ status: 'approved' })
+    .eq('id', id)
+    .eq('company_id', companyId)
+    .select()
+    .single()
+
+  if (error) return { error: error.message, status: 500 }
+
+  try {
+    await eventBus.emit({
+      type: 'supplier_invoice.approved',
+      payload: { supplierInvoice: data, companyId, userId },
+    })
+  } catch { /* non-blocking */ }
+
+  return { data: { supplier_invoice_id: id, status: 'approved' } }
+}
+
+async function commitCreditSupplierInvoice(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const id = params.supplier_invoice_id as string
+  if (!id) return { error: 'supplier_invoice_id is required', status: 400 }
+
+  const { data: original, error: fetchError } = await supabase
+    .from('supplier_invoices')
+    .select('*, supplier:suppliers(*), items:supplier_invoice_items(*)')
+    .eq('id', id)
+    .eq('company_id', companyId)
+    .single()
+
+  if (fetchError || !original) return { error: 'Supplier invoice not found', status: 404 }
+  if (original.status === 'credited') return { error: 'Fakturan har redan krediterats', status: 409 }
+
+  const { data: arrivalNum } = await supabase.rpc('get_next_arrival_number', { p_company_id: companyId })
+
+  const { data: creditNote, error: creditError } = await supabase
+    .from('supplier_invoices')
+    .insert({
+      user_id: userId,
+      company_id: companyId,
+      supplier_id: original.supplier_id,
+      arrival_number: arrivalNum,
+      supplier_invoice_number: `KREDIT-${original.supplier_invoice_number}`,
+      invoice_date: new Date().toISOString().split('T')[0],
+      due_date: new Date().toISOString().split('T')[0],
+      status: 'registered',
+      currency: original.currency,
+      exchange_rate: original.exchange_rate,
+      vat_treatment: original.vat_treatment,
+      reverse_charge: original.reverse_charge,
+      subtotal: original.subtotal,
+      subtotal_sek: original.subtotal_sek,
+      vat_amount: original.vat_amount,
+      vat_amount_sek: original.vat_amount_sek,
+      total: original.total,
+      total_sek: original.total_sek,
+      remaining_amount: 0,
+      is_credit_note: true,
+      credited_invoice_id: id,
+    })
+    .select()
+    .single()
+
+  if (creditError || !creditNote) return { error: creditError?.message ?? 'Failed to create credit note', status: 500 }
+
+  const creditItems = (original.items ?? []).map((item: Record<string, unknown>) => ({
+    supplier_invoice_id: creditNote.id,
+    sort_order: item.sort_order,
+    description: item.description,
+    quantity: item.quantity,
+    unit: item.unit,
+    unit_price: item.unit_price,
+    line_total: item.line_total,
+    account_number: item.account_number,
+    vat_code: item.vat_code,
+    vat_rate: item.vat_rate,
+    vat_amount: item.vat_amount,
+  }))
+  await supabase.from('supplier_invoice_items').insert(creditItems)
+
+  const { data: settings } = await supabase
+    .from('company_settings').select('accounting_method').eq('company_id', companyId).single()
+  const accountingMethod = settings?.accounting_method || 'accrual'
+
+  let journalEntryId: string | null = null
+  if (accountingMethod === 'accrual') {
+    try {
+      const je = await createSupplierCreditNoteEntry(
+        supabase,
+        companyId,
+        userId,
+        creditNote,
+        creditItems as never,
+        original.supplier?.supplier_type || 'swedish_business',
+        original.supplier?.name
+      )
+      if (je) {
+        journalEntryId = je.id
+        await supabase
+          .from('supplier_invoices')
+          .update({ registration_journal_entry_id: je.id })
+          .eq('id', creditNote.id)
+      }
+    } catch (err) {
+      await supabase.from('supplier_invoices').delete().eq('id', creditNote.id).eq('company_id', companyId)
+      if (isBookkeepingError(err)) throw err
+      return { error: err instanceof Error ? err.message : 'Failed to book credit note', status: 500 }
+    }
+  }
+
+  const newRemaining = Math.max(0, original.remaining_amount - original.total)
+  const newStatus = newRemaining <= 0 ? 'credited' : original.status
+
+  await supabase
+    .from('supplier_invoices')
+    .update({ status: newStatus, remaining_amount: newRemaining })
+    .eq('id', id)
+
+  try {
+    await eventBus.emit({
+      type: 'supplier_invoice.credited',
+      payload: { supplierInvoice: original, creditNote, companyId, userId },
+    })
+  } catch { /* non-blocking */ }
+
+  return { data: { credit_note_id: creditNote.id, journal_entry_id: journalEntryId } }
+}
+
+async function commitCreditInvoice(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const id = params.invoice_id as string
+  const reason = params.reason as string | undefined
+  if (!id) return { error: 'invoice_id is required', status: 400 }
+
+  const { data: original, error: fetchError } = await supabase
+    .from('invoices')
+    .select('*, items:invoice_items(*)')
+    .eq('id', id)
+    .eq('company_id', companyId)
+    .single()
+
+  if (fetchError || !original) return { error: 'Original invoice not found', status: 404 }
+  if (original.document_type && original.document_type !== 'invoice') {
+    return { error: 'Credit notes can only be created from standard invoices', status: 400 }
+  }
+  if (original.status === 'credited') return { error: 'Invoice has already been credited', status: 409 }
+  if (!['sent', 'paid', 'overdue'].includes(original.status)) {
+    return { error: 'Only sent, paid, or overdue invoices can be credited', status: 400 }
+  }
+
+  const today = new Date().toISOString().split('T')[0]
+  const creditNoteNumber = `KR-${original.invoice_number}`
+
+  const { data: creditNote, error: creditNoteError } = await supabase
+    .from('invoices')
+    .insert({
+      user_id: userId,
+      company_id: companyId,
+      customer_id: original.customer_id,
+      invoice_number: creditNoteNumber,
+      invoice_date: today,
+      due_date: today,
+      delivery_date: original.delivery_date ?? null,
+      currency: original.currency,
+      exchange_rate: original.exchange_rate,
+      exchange_rate_date: original.exchange_rate_date,
+      subtotal: -Math.abs(original.subtotal),
+      subtotal_sek: original.subtotal_sek != null ? -Math.abs(original.subtotal_sek) : null,
+      vat_amount: -Math.abs(original.vat_amount),
+      vat_amount_sek: original.vat_amount_sek != null ? -Math.abs(original.vat_amount_sek) : null,
+      total: -Math.abs(original.total),
+      total_sek: original.total_sek != null ? -Math.abs(original.total_sek) : null,
+      vat_treatment: original.vat_treatment,
+      vat_rate: original.vat_rate,
+      moms_ruta: original.moms_ruta,
+      reverse_charge_text: original.reverse_charge_text,
+      your_reference: original.your_reference,
+      our_reference: original.our_reference,
+      notes: reason || `Krediterar faktura ${original.invoice_number}`,
+      credited_invoice_id: id,
+      status: 'sent',
+    })
+    .select()
+    .single()
+
+  if (creditNoteError || !creditNote) {
+    return { error: creditNoteError?.message ?? 'Failed to create credit note', status: 500 }
+  }
+
+  const creditItems = (original.items || []).map((item: {
+    sort_order: number
+    description: string
+    quantity: number
+    unit: string
+    unit_price: number
+    line_total: number
+    vat_rate?: number
+    vat_amount?: number
+  }) => ({
+    invoice_id: creditNote.id,
+    sort_order: item.sort_order,
+    description: item.description,
+    quantity: -Math.abs(item.quantity),
+    unit: item.unit,
+    unit_price: item.unit_price,
+    line_total: -Math.abs(item.line_total),
+    vat_rate: item.vat_rate ?? 0,
+    vat_amount: -(item.vat_amount ? Math.abs(item.vat_amount) : 0),
+  }))
+
+  const { error: itemsError } = await supabase
+    .from('invoice_items')
+    .insert(creditItems)
+
+  if (itemsError) {
+    await supabase.from('invoices').delete().eq('id', creditNote.id)
+    return { error: itemsError.message, status: 500 }
+  }
+
+  await supabase.from('invoices').update({ status: 'credited' }).eq('id', id)
+
+  const { data: completeCreditNote } = await supabase
+    .from('invoices')
+    .select('*, customer:customers(*), items:invoice_items(*)')
+    .eq('id', creditNote.id)
+    .single()
+
+  const { data: settings } = await supabase
+    .from('company_settings')
+    .select('entity_type, accounting_method')
+    .eq('company_id', companyId)
+    .single()
+
+  const entityType = (settings?.entity_type as EntityType) || 'enskild_firma'
+  const accountingMethod = (settings?.accounting_method as AccountingMethod) || 'accrual'
+
+  // Resolve the original verifikation reference so the credit-note JE can
+  // point back to the corrected entry per BFL 5 kap. 5 §. We tolerate
+  // missing-JE on the original (legacy data) — the description simply omits
+  // the voucher reference and keeps the invoice-number reference.
+  let originalVoucherRef: string | undefined
+  if (original.journal_entry_id) {
+    const { data: origJe } = await supabase
+      .from('journal_entries')
+      .select('voucher_series, voucher_number')
+      .eq('id', original.journal_entry_id)
+      .eq('company_id', companyId)
+      .maybeSingle()
+    if (origJe?.voucher_series && origJe?.voucher_number != null) {
+      originalVoucherRef = `${origJe.voucher_series}-${origJe.voucher_number}`
+    }
+  }
+
+  let journalEntryId: string | null = null
+  if (completeCreditNote && accountingMethod === 'accrual') {
+    try {
+      const journalEntry = await createCreditNoteJournalEntry(
+        supabase,
+        companyId,
+        userId,
+        completeCreditNote as Invoice,
+        entityType,
+        completeCreditNote.customer?.name,
+        originalVoucherRef
+      )
+      if (journalEntry) {
+        journalEntryId = journalEntry.id
+        await supabase
+          .from('invoices')
+          .update({ journal_entry_id: journalEntry.id })
+          .eq('id', creditNote.id)
+      }
+    } catch (err) {
+      if (isBookkeepingError(err)) throw err
+      log.error('Failed to create credit note journal entry:', err)
+    }
+
+    try {
+      await eventBus.emit({
+        type: 'credit_note.created',
+        payload: { creditNote: completeCreditNote as CreditNote, companyId, userId },
+      })
+    } catch { /* non-blocking */ }
+  }
+
+  return { data: { credit_note_id: creditNote.id, journal_entry_id: journalEntryId } }
+}
+
+async function commitConvertInvoice(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const id = params.invoice_id as string
+  if (!id) return { error: 'invoice_id is required', status: 400 }
+
+  const { data: proforma, error: proformaError } = await supabase
+    .from('invoices').select('*, items:invoice_items(*)').eq('id', id).eq('company_id', companyId).single()
+
+  if (proformaError || !proforma) return { error: 'Proformafakturan hittades inte', status: 404 }
+  if (proforma.document_type !== 'proforma') {
+    return { error: 'Endast proformafakturor kan konverteras', status: 400 }
+  }
+  if (proforma.status === 'cancelled') {
+    return { error: 'Denna proformafaktura har redan makuleras', status: 409 }
+  }
+
+  const { data: invoice, error: invoiceError } = await supabase
+    .from('invoices')
+    .insert({
+      user_id: userId,
+      company_id: companyId,
+      customer_id: proforma.customer_id,
+      invoice_number: null,
+      invoice_date: new Date().toISOString().split('T')[0],
+      due_date: proforma.due_date,
+      currency: proforma.currency,
+      exchange_rate: proforma.exchange_rate,
+      exchange_rate_date: proforma.exchange_rate_date,
+      subtotal: proforma.subtotal,
+      subtotal_sek: proforma.subtotal_sek,
+      vat_amount: proforma.vat_amount,
+      vat_amount_sek: proforma.vat_amount_sek,
+      total: proforma.total,
+      total_sek: proforma.total_sek,
+      vat_treatment: proforma.vat_treatment,
+      vat_rate: proforma.vat_rate,
+      moms_ruta: proforma.moms_ruta,
+      reverse_charge_text: proforma.reverse_charge_text,
+      your_reference: proforma.your_reference,
+      our_reference: proforma.our_reference,
+      notes: proforma.notes,
+      document_type: 'invoice',
+      converted_from_id: id,
+    })
+    .select()
+    .single()
+
+  if (invoiceError) return { error: invoiceError.message, status: 500 }
+
+  try {
+    await ensureInvoiceNumber(supabase, companyId, invoice as Invoice)
+  } catch (err) {
+    await supabase.from('invoices').delete().eq('id', invoice.id)
+    return { error: err instanceof Error ? err.message : 'Failed to assign invoice number', status: 500 }
+  }
+
+  const items = (proforma.items ?? []).map((item: Record<string, unknown>) => ({
+    invoice_id: invoice.id,
+    sort_order: item.sort_order,
+    description: item.description,
+    quantity: item.quantity,
+    unit: item.unit,
+    unit_price: item.unit_price,
+    line_total: item.line_total,
+  }))
+
+  if (items.length > 0) {
+    const { error: itemsError } = await supabase.from('invoice_items').insert(items)
+    if (itemsError) {
+      await supabase.from('invoices').delete().eq('id', invoice.id)
+      return { error: itemsError.message, status: 500 }
+    }
+  }
+
+  await supabase.from('invoices').update({ status: 'cancelled' }).eq('id', id)
+
+  return { data: { invoice_id: invoice.id, invoice_number: invoice.invoice_number } }
+}
+
+async function commitImportSie(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const fileContent = params.file_content as string
+  const filename = params.filename as string
+  const mappings = params.mappings as AccountMapping[] | undefined
+  const createFiscalPeriod = Boolean(params.create_fiscal_period)
+  const importOpeningBalances = Boolean(params.import_opening_balances)
+  const importTransactions = Boolean(params.import_transactions)
+  const voucherSeries = params.voucher_series as string | undefined
+
+  if (!fileContent || !filename || !Array.isArray(mappings)) {
+    return { error: 'file_content, filename, and mappings are required', status: 400 }
+  }
+
+  let parsed
+  try {
+    parsed = parseSIEFile(fileContent)
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : 'Failed to parse SIE file', status: 400 }
+  }
+
+  try {
+    const result = await executeSIEImport(supabase, companyId, userId, parsed, mappings, {
+      filename,
+      fileContent,
+      createFiscalPeriod,
+      importOpeningBalances,
+      importTransactions,
+      voucherSeries,
+    })
+
+    if (!result.success) {
+      return { error: result.errors.join('; ') || 'SIE import failed', status: 400 }
+    }
+
+    return {
+      data: {
+        import_id: result.importId,
+        fiscal_period_id: result.fiscalPeriodId,
+        opening_balance_entry_id: result.openingBalanceEntryId,
+        journal_entries_created: result.journalEntriesCreated,
+        warnings: result.warnings,
+      },
+    }
+  } catch (err) {
+    if (isBookkeepingError(err)) throw err
+    return { error: err instanceof Error ? err.message : 'SIE import failed', status: 500 }
+  }
+}
+
+// ── Public dispatcher ────────────────────────────────────────────
+
+/**
+ * Execute a pending_operation by type, update its status row, and return a
+ * normalized CommitResult.
+ *
+ * Used by both the human-approval route and the auto-commit path. Status row
+ * transitions are applied here so the two callers stay consistent.
+ */
+export async function commitPendingOperation(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  pendingOp: PendingOperation,
+  opts: CommitOptions = {}
+): Promise<CommitResult> {
+  // ── Atomic claim: flip status pending → committing in a single conditional
+  //    update. If 0 rows are affected, another caller (auto-commit ↔ human
+  //    approval, or two parallel approvals) already claimed this op and we
+  //    must not run side-effects. Without this, both callers can pass the
+  //    in-memory status check and double-book journal entries, send duplicate
+  //    emails, etc.
+  const { data: claimed, error: claimError } = await supabase
+    .from('pending_operations')
+    .update({ status: 'committing' })
+    .eq('id', pendingOp.id)
+    .eq('status', 'pending')
+    .select('id')
+    .maybeSingle()
+
+  if (claimError) {
+    log.error('Failed to claim pending_operation:', claimError)
+    return { status: 'failed', error: 'Failed to claim operation', http_status: 500 }
+  }
+  if (!claimed) {
+    return {
+      status: 'failed',
+      error: 'Operation already claimed or resolved by another caller',
+      http_status: 409,
+    }
+  }
+
+  let result: ExecutorResult
+  try {
+    switch (pendingOp.operation_type) {
+      case 'categorize_transaction':
+        result = await commitCategorizeTransaction(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'create_customer':
+        result = await commitCreateCustomer(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'create_invoice':
+        result = await commitCreateInvoice(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'mark_invoice_paid':
+        result = await commitMarkInvoicePaid(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'send_invoice':
+        result = await commitSendInvoice(supabase, userId, companyId, pendingOp.params, opts.userEmail)
+        break
+      case 'mark_invoice_sent':
+        result = await commitMarkInvoiceSent(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'match_transaction_invoice':
+        result = await commitMatchTransactionInvoice(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'close_period':
+        result = await commitClosePeriod(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'lock_period':
+        result = await commitLockPeriod(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'unlock_period':
+        result = await commitUnlockPeriod(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'uncategorize_transaction':
+        result = await commitUncategorizeTransaction(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'run_year_end':
+        result = await commitRunYearEnd(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'set_opening_balances':
+        result = await commitSetOpeningBalances(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'run_currency_revaluation':
+        result = await commitRunCurrencyRevaluation(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'explain_voucher_gap':
+        result = await commitExplainVoucherGap(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'approve_supplier_invoice':
+        result = await commitApproveSupplierInvoice(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'credit_supplier_invoice':
+        result = await commitCreditSupplierInvoice(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'convert_invoice':
+        result = await commitConvertInvoice(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'credit_invoice':
+        result = await commitCreditInvoice(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'import_sie':
+        result = await commitImportSie(supabase, userId, companyId, pendingOp.params)
+        break
+      default:
+        return {
+          status: 'failed',
+          error: `Unknown operation type: ${pendingOp.operation_type}`,
+          http_status: 400,
+        }
+    }
+  } catch (err) {
+    const isBkErr = isBookkeepingError(err)
+    const message = err instanceof Error ? err.message : (isBkErr ? 'Bookkeeping error' : 'Executor failed')
+    // Release the claim by transitioning to 'rejected' so the row never gets
+    // stuck in 'committing'. The error text is persisted in result_data for
+    // audit/debug.
+    await supabase
+      .from('pending_operations')
+      .update({
+        status: 'rejected',
+        resolved_at: new Date().toISOString(),
+        result_data: { error: message, threw: true },
+      })
+      .eq('id', pendingOp.id)
+    return {
+      status: 'failed',
+      error: message,
+      http_status: isBkErr ? 400 : 500,
+    }
+  }
+
+  if (result.error) {
+    const isAutoReject = result.status === 404 || result.status === 409
+    await supabase
+      .from('pending_operations')
+      .update({
+        status: 'rejected',
+        resolved_at: new Date().toISOString(),
+        result_data: isAutoReject
+          ? { auto_rejected: true, reason: result.error }
+          : { error: result.error, http_status: result.status },
+      })
+      .eq('id', pendingOp.id)
+    if (isAutoReject) {
+      return {
+        status: 'rejected',
+        auto_rejected: true,
+        error: result.error,
+        http_status: result.status,
+      }
+    }
+    return {
+      status: 'failed',
+      error: result.error,
+      http_status: result.status ?? 500,
+    }
+  }
+
+  const now = new Date().toISOString()
+  const update: Record<string, unknown> = {
+    status: 'committed',
+    resolved_at: now,
+    result_data: result.data || {},
+  }
+  if (opts.isAutoCommit) {
+    update.auto_committed_at = now
+  }
+
+  await supabase
+    .from('pending_operations')
+    .update(update)
+    .eq('id', pendingOp.id)
+
+  return {
+    status: 'committed',
+    data: result.data,
+  }
+}

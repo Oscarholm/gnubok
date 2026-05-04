@@ -262,6 +262,12 @@ export interface CompanySettings {
   ai_flow_enabled: boolean
   ai_backfill_cancel_requested: boolean
 
+  // Agent auto-commit. When enabled, low-risk pending_operations staged by
+  // trusted agents (api_key, mcp_oauth) skip human review. High-risk ops
+  // (period close, year-end, send_invoice, etc.) always require approval.
+  agent_auto_commit_enabled: boolean
+  agent_auto_commit_max_amount: number | null
+
   // Timestamps
   created_at: string
   updated_at: string
@@ -1310,8 +1316,37 @@ export interface CreateFiscalPeriodInput {
 
 // ── Pending Operations ────────────────────────────────────────
 
-export type PendingOperationType = 'categorize_transaction' | 'create_customer' | 'create_invoice' | 'mark_invoice_paid' | 'send_invoice' | 'mark_invoice_sent' | 'match_transaction_invoice'
-export type PendingOperationStatus = 'pending' | 'committed' | 'rejected'
+export type PendingOperationType =
+  | 'categorize_transaction'
+  | 'create_customer'
+  | 'create_invoice'
+  | 'mark_invoice_paid'
+  | 'send_invoice'
+  | 'mark_invoice_sent'
+  | 'match_transaction_invoice'
+  // Stream 1 Phase 1: bookkeeping period operations
+  | 'close_period'
+  | 'lock_period'
+  | 'unlock_period'
+  | 'set_opening_balances'
+  | 'run_year_end'
+  | 'run_currency_revaluation'
+  // Stream 1 Phase 1: SIE import (export is read-only)
+  | 'import_sie'
+  // Stream 1 Phase 1: voucher gap explanations
+  | 'explain_voucher_gap'
+  // Stream 1 Phase 1: transaction reversal
+  | 'uncategorize_transaction'
+  // Stream 1 Phase 1: supplier invoice lifecycle
+  | 'approve_supplier_invoice'
+  | 'credit_supplier_invoice'
+  // Stream 1 Phase 1: invoice operations beyond simple create/send
+  | 'credit_invoice'
+  | 'convert_invoice'
+export type PendingOperationStatus = 'pending' | 'committing' | 'committed' | 'rejected'
+
+export type PendingOperationActorType = 'user' | 'api_key' | 'mcp_oauth' | 'cron'
+export type PendingOperationRiskLevel = 'low' | 'medium' | 'high'
 
 export interface PendingOperation {
   id: string
@@ -1323,6 +1358,14 @@ export interface PendingOperation {
   params: Record<string, unknown>
   preview_data: Record<string, unknown>
   result_data: Record<string, unknown> | null
+  // Stream 2 Phase 1: actor model
+  actor_type: PendingOperationActorType
+  actor_id: string | null
+  actor_label: string | null
+  risk_level: PendingOperationRiskLevel
+  // Stream 2 Phase 2: auto-commit tracking
+  auto_commit_eligible: boolean
+  auto_committed_at: string | null
   created_at: string
   resolved_at: string | null
   updated_at: string
@@ -2146,6 +2189,8 @@ export interface AuditLogEntry {
   table_name: string | null
   record_id: string | null
   actor_id: string | null
+  actor_type: 'user' | 'api_key' | 'mcp_oauth' | 'cron' | 'system' | null
+  actor_label: string | null
   old_state: Record<string, unknown> | null
   new_state: Record<string, unknown> | null
   description: string | null
