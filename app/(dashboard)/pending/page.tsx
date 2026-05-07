@@ -1,10 +1,11 @@
 'use client'
 
-import { useState, useEffect, useCallback, Fragment } from 'react'
+import { useState, useEffect, useCallback, useMemo, Fragment } from 'react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { ConfirmationDialog } from '@/components/ui/confirmation-dialog'
 import { DestructiveConfirmDialog, useDestructiveConfirm } from '@/components/ui/destructive-confirm-dialog'
@@ -31,6 +32,50 @@ const operationLabels: Record<string, { label: string; icon: typeof ArrowLeftRig
   send_invoice: { label: 'Skicka faktura', icon: Receipt, variant: 'outline' },
   mark_invoice_sent: { label: 'Markera skickad', icon: Receipt, variant: 'outline' },
   match_transaction_invoice: { label: 'Fakturamatchning', icon: ArrowLeftRight, variant: 'secondary' },
+}
+
+// Terse per-type labels used in the bulk confirmation dialog list. Phrased so
+// they read naturally under the heading "Genom att bekräfta utförs följande:".
+const bulkActionDescriptions: Record<string, (count: number) => string> = {
+  create_transaction: (n) =>
+    n === 1 ? 'En transaktion skapas.' : `${n} transaktioner skapas.`,
+  create_customer: (n) => (n === 1 ? 'En ny kund skapas.' : `${n} nya kunder skapas.`),
+  create_invoice: (n) =>
+    n === 1 ? 'Ett fakturautkast skapas (skickas inte).' : `${n} fakturautkast skapas (skickas inte).`,
+  categorize_transaction: (n) =>
+    n === 1 ? 'En transaktion kategoriseras och bokförs.' : `${n} transaktioner kategoriseras och bokförs.`,
+  match_transaction_invoice: (n) =>
+    n === 1 ? 'En transaktion matchas mot en faktura.' : `${n} transaktioner matchas mot fakturor.`,
+  attach_document_to_transaction: (n) =>
+    n === 1 ? 'Ett dokument bifogas en transaktion.' : `${n} dokument bifogas transaktioner.`,
+  uncategorize_transaction: (n) =>
+    n === 1 ? 'En kategorisering tas bort.' : `${n} kategoriseringar tas bort.`,
+}
+
+function bulkActionLabel(operationType: string, count: number): string {
+  const fn = bulkActionDescriptions[operationType]
+  if (fn) return fn(count)
+  const fallback = operationLabels[operationType]?.label ?? operationType
+  return `${count} × ${fallback}`
+}
+
+// Full-sentence warning for the single-op confirmation dialog. Phrased so the
+// user sees the consequence of clicking Godkänn, not a generic verifikation note.
+const singleActionWarnings: Record<string, string> = {
+  create_transaction: 'Genom att klicka godkänn så skapar du en transaktion.',
+  create_customer: 'Genom att klicka godkänn så skapar du en kund.',
+  create_invoice: 'Genom att klicka godkänn så skapas ett fakturautkast (det skickas inte).',
+  categorize_transaction: 'Genom att klicka godkänn så kategoriseras transaktionen och en verifikation skapas.',
+  match_transaction_invoice: 'Genom att klicka godkänn så matchas transaktionen mot fakturan.',
+  attach_document_to_transaction: 'Genom att klicka godkänn så bifogas dokumentet till transaktionen.',
+  uncategorize_transaction: 'Genom att klicka godkänn så tas kategoriseringen bort.',
+  send_invoice: 'Genom att klicka godkänn så skickas fakturan till kunden.',
+  mark_invoice_paid: 'Genom att klicka godkänn så bokförs en betalning på fakturan.',
+  mark_invoice_sent: 'Genom att klicka godkänn så märks fakturan som skickad och en verifikation skapas.',
+}
+
+function singleActionWarning(operationType: string): string {
+  return singleActionWarnings[operationType] ?? ''
 }
 
 function formatRelativeTime(dateStr: string): string {
@@ -205,6 +250,9 @@ export default function PendingOperationsPage() {
   const [selectedOp, setSelectedOp] = useState<PendingOperation | null>(null)
   const [showCommitDialog, setShowCommitDialog] = useState(false)
   const [isCommitting, setIsCommitting] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [showBulkDialog, setShowBulkDialog] = useState(false)
+  const [isBulkCommitting, setIsBulkCommitting] = useState(false)
   const { toast } = useToast()
   const { dialogProps, confirm } = useDestructiveConfirm()
 
@@ -223,6 +271,11 @@ export default function PendingOperationsPage() {
   useEffect(() => {
     fetchOperations()
   }, [fetchOperations])
+
+  // Clear selection when filters/tab change
+  useEffect(() => {
+    setSelectedIds(new Set())
+  }, [activeTab, sourceFilter])
 
   async function handleCommit() {
     if (!selectedOp) return
@@ -245,6 +298,51 @@ export default function PendingOperationsPage() {
     setIsCommitting(false)
   }
 
+  async function handleBulkCommit(ids: string[]) {
+    if (ids.length === 0) return
+    setIsBulkCommitting(true)
+    try {
+      const res = await fetch('/api/pending-operations/bulk-commit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids }),
+      })
+      const json = await res.json()
+      if (!res.ok) throw new Error(json.error || 'Misslyckades')
+
+      const summary = json.data?.summary as
+        | { committed: number; failed: number; skipped: number; rejected: number }
+        | undefined
+
+      if (summary) {
+        const parts: string[] = []
+        if (summary.committed > 0) parts.push(`${summary.committed} godkända`)
+        if (summary.failed > 0) parts.push(`${summary.failed} misslyckades`)
+        if (summary.rejected > 0) parts.push(`${summary.rejected} avvisade`)
+        if (summary.skipped > 0) parts.push(`${summary.skipped} hoppades över`)
+
+        toast({
+          title: summary.failed > 0 ? 'Klart med fel' : 'Godkänt',
+          description: parts.join(', '),
+          variant: summary.failed > 0 ? 'destructive' : 'default',
+        })
+      } else {
+        toast({ title: 'Godkänt' })
+      }
+
+      setShowBulkDialog(false)
+      setSelectedIds(new Set())
+      fetchOperations()
+    } catch (err) {
+      toast({
+        title: 'Misslyckades',
+        description: err instanceof Error ? err.message : 'Okänt fel',
+        variant: 'destructive',
+      })
+    }
+    setIsBulkCommitting(false)
+  }
+
   async function handleReject(op: PendingOperation) {
     const ok = await confirm({
       title: 'Avvisa operation?',
@@ -264,12 +362,6 @@ export default function PendingOperationsPage() {
     }
   }
 
-  const warningForType: Record<string, string> = {
-    categorize_transaction: '',
-    create_customer: '',
-    create_invoice: '',
-  }
-
   const filteredOperations = operations.filter((op) => {
     switch (sourceFilter) {
       case 'agent':
@@ -281,6 +373,62 @@ export default function PendingOperationsPage() {
         return true
     }
   })
+
+  const showBulkControls = activeTab === 'pending'
+  const bulkEligible = useMemo(
+    () => filteredOperations.filter((op) => op.status === 'pending' && op.risk_level !== 'high'),
+    [filteredOperations]
+  )
+  const bulkEligibleIds = useMemo(() => bulkEligible.map((op) => op.id), [bulkEligible])
+  const allSelected =
+    bulkEligibleIds.length > 0 && bulkEligibleIds.every((id) => selectedIds.has(id))
+  const someSelected = bulkEligibleIds.some((id) => selectedIds.has(id))
+
+  function toggleSelected(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  function toggleSelectAll() {
+    if (allSelected) {
+      setSelectedIds(new Set())
+    } else {
+      setSelectedIds(new Set(bulkEligibleIds))
+    }
+  }
+
+  // "Approve all of this type" — find ops with the same operation_type that are bulk-eligible
+  function selectAllOfType(operationType: string) {
+    const ids = bulkEligible
+      .filter((op) => op.operation_type === operationType)
+      .map((op) => op.id)
+    setSelectedIds(new Set(ids))
+  }
+
+  // Group counts for type-quick-action buttons (only show if 2+ of same type pending)
+  const typeCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const op of bulkEligible) {
+      counts.set(op.operation_type, (counts.get(op.operation_type) ?? 0) + 1)
+    }
+    return Array.from(counts.entries()).filter(([, count]) => count >= 2)
+  }, [bulkEligible])
+
+  const selectedCount = selectedIds.size
+
+  const selectedBreakdown = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const op of bulkEligible) {
+      if (selectedIds.has(op.id)) {
+        counts.set(op.operation_type, (counts.get(op.operation_type) ?? 0) + 1)
+      }
+    }
+    return Array.from(counts.entries()).map(([type, count]) => ({ type, count }))
+  }, [bulkEligible, selectedIds])
 
   return (
     <div className="space-y-6">
@@ -304,6 +452,65 @@ export default function PendingOperationsPage() {
           <TabsTrigger value="high_risk">Hög risk</TabsTrigger>
         </TabsList>
       </Tabs>
+
+      {showBulkControls && bulkEligible.length > 0 && (
+        <div className="flex flex-wrap items-center gap-3 rounded-md border bg-muted/30 px-3 py-2">
+          <div className="flex items-center gap-2">
+            <Checkbox
+              id="select-all"
+              checked={allSelected ? true : someSelected ? 'indeterminate' : false}
+              onCheckedChange={() => toggleSelectAll()}
+              aria-label="Markera alla"
+            />
+            <label htmlFor="select-all" className="text-sm cursor-pointer">
+              {selectedCount > 0
+                ? `${selectedCount} valda`
+                : `Markera alla (${bulkEligible.length})`}
+            </label>
+          </div>
+
+          {typeCounts.length > 0 && selectedCount === 0 && (
+            <div className="flex flex-wrap items-center gap-1">
+              <span className="text-xs text-muted-foreground">Snabbval:</span>
+              {typeCounts.map(([type, count]) => {
+                const config = operationLabels[type] || { label: type }
+                return (
+                  <Button
+                    key={type}
+                    size="sm"
+                    variant="outline"
+                    className="h-7 px-2 text-xs"
+                    onClick={() => selectAllOfType(type)}
+                  >
+                    {config.label} ({count})
+                  </Button>
+                )
+              })}
+            </div>
+          )}
+
+          <div className="ml-auto flex items-center gap-2">
+            {selectedCount > 0 && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-8 px-3 text-xs"
+                onClick={() => setSelectedIds(new Set())}
+              >
+                Avmarkera
+              </Button>
+            )}
+            <Button
+              size="sm"
+              className="h-8 px-3 text-xs"
+              disabled={selectedCount === 0 || isBulkCommitting}
+              onClick={() => setShowBulkDialog(true)}
+            >
+              Godkänn valda ({selectedCount})
+            </Button>
+          </div>
+        </div>
+      )}
 
       {isLoading ? (
         <Card>
@@ -336,6 +543,8 @@ export default function PendingOperationsPage() {
           {filteredOperations.map((op) => {
             const config = operationLabels[op.operation_type] || { label: op.operation_type, icon: ClipboardCheck, variant: 'default' as const }
             const isExpanded = expandedId === op.id
+            const canBulkSelect = showBulkControls && op.status === 'pending' && op.risk_level !== 'high'
+            const isSelected = selectedIds.has(op.id)
 
             return (
               <Card
@@ -347,6 +556,18 @@ export default function PendingOperationsPage() {
                     className="flex items-start justify-between gap-4 cursor-pointer"
                     onClick={() => setExpandedId(isExpanded ? null : op.id)}
                   >
+                    {canBulkSelect && (
+                      <div
+                        className="flex items-center pt-0.5"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <Checkbox
+                          checked={isSelected}
+                          onCheckedChange={() => toggleSelected(op.id)}
+                          aria-label="Välj operation"
+                        />
+                      </div>
+                    )}
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 mb-1 flex-wrap">
                         <Badge variant={config.variant}>{config.label}</Badge>
@@ -428,12 +649,38 @@ export default function PendingOperationsPage() {
         open={showCommitDialog}
         onOpenChange={setShowCommitDialog}
         title={selectedOp?.title || 'Godkänn operation'}
-        warningText={selectedOp ? warningForType[selectedOp.operation_type] : ''}
+        warningText={selectedOp ? singleActionWarning(selectedOp.operation_type) : ''}
         confirmLabel="Godkänn"
         isSubmitting={isCommitting}
         onConfirm={handleCommit}
       >
         {selectedOp && <OperationPreview op={selectedOp} />}
+      </ConfirmationDialog>
+
+      {/* Bulk commit confirmation dialog */}
+      <ConfirmationDialog
+        open={showBulkDialog}
+        onOpenChange={setShowBulkDialog}
+        title={`Godkänn ${selectedCount} operationer?`}
+        warningText=""
+        confirmLabel={`Godkänn ${selectedCount}`}
+        isSubmitting={isBulkCommitting}
+        onConfirm={() => handleBulkCommit(Array.from(selectedIds))}
+      >
+        <div className="space-y-3 text-sm">
+          <p>Genom att bekräfta utförs följande:</p>
+          <ul className="space-y-1 rounded-md border bg-muted/30 px-3 py-2">
+            {selectedBreakdown.map(({ type, count }) => (
+              <li key={type} className="flex justify-between font-mono tabular-nums">
+                <span className="font-sans">{bulkActionLabel(type, count)}</span>
+                <span className="text-muted-foreground">{count}</span>
+              </li>
+            ))}
+          </ul>
+          <p className="text-xs text-muted-foreground">
+            Operationerna körs i ordning. Misslyckade hoppas över och rapporteras efteråt.
+          </p>
+        </div>
       </ConfirmationDialog>
 
       {/* Reject confirmation dialog */}
