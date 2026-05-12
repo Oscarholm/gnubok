@@ -11,7 +11,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { useToast } from '@/components/ui/use-toast'
 import { ToastAction } from '@/components/ui/toast'
 import { DestructiveConfirmDialog, useDestructiveConfirm } from '@/components/ui/destructive-confirm-dialog'
-import { X } from 'lucide-react'
+import { Landmark, X } from 'lucide-react'
 import TransactionForm from '@/components/transactions/TransactionForm'
 import SwipeCategorizationView from '@/components/transactions/SwipeCategorizationView'
 import BatchCategorySelector from '@/components/transactions/BatchCategorySelector'
@@ -19,6 +19,8 @@ import TransactionStatusBar from '@/components/transactions/TransactionStatusBar
 import TransactionInboxCard from '@/components/transactions/TransactionInboxCard'
 import TransactionHistoryList from '@/components/transactions/TransactionHistoryList'
 import InboxZeroState from '@/components/transactions/InboxZeroState'
+import SkattekontoInboxCard from '@/components/transactions/SkattekontoInboxCard'
+import { SkattekontoMatchDialog } from '@/components/skattekonto/SkattekontoMatchDialog'
 import InvoiceMatchDialog from '@/components/transactions/InvoiceMatchDialog'
 import InvoicePicker from '@/components/transactions/InvoicePicker'
 import TransactionBookingDialog from '@/components/transactions/TransactionBookingDialog'
@@ -31,9 +33,14 @@ import { getTemplateById, type BookingTemplate } from '@/lib/bookkeeping/booking
 import { isCounterpartyTemplateId, extractCounterpartyId } from '@/lib/bookkeeping/counterparty-templates'
 import { isLibraryTemplateId } from '@/lib/bookkeeping/template-library'
 import type { TransactionWithInvoice, ViewMode, CategorizeHandler } from '@/components/transactions/transaction-types'
+import type {
+  SkattekontoTransactionWithSuggestion,
+  StoredSkattekontoTransaction,
+} from '@/types/skatteverket'
+import { findBankSkvCounterparts } from '@/lib/skatteverket/bank-counterpart'
 import { useCompany } from '@/contexts/CompanyContext'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
-import { formatCurrency, formatDate } from '@/lib/utils'
+import { cn, formatCurrency, formatDate } from '@/lib/utils'
 import type { TransactionCategory, CreateTransactionInput, Invoice, Customer, SupplierInvoice, Supplier, VatTreatment, EntityType, LinePatternEntry } from '@/types'
 import type { SuggestedCategory, SuggestedTemplate } from '@/lib/transactions/category-suggestions'
 
@@ -121,6 +128,19 @@ export default function TransactionsPage() {
   // Set of transaction IDs that are animating out (just categorized)
   const [exitingIds, setExitingIds] = useState<Set<string>>(new Set())
 
+  // Skattekonto rows (unmatched, status='booked'). Loaded if the
+  // Skatteverket extension is enabled and connected. 503/401 → silently
+  // hidden (extension disabled or user not connected).
+  const [skvRows, setSkvRows] = useState<SkattekontoTransactionWithSuggestion[]>([])
+  const [skvProcessingId, setSkvProcessingId] = useState<string | null>(null)
+  const [skvMatchTarget, setSkvMatchTarget] = useState<StoredSkattekontoTransaction | null>(
+    null,
+  )
+
+  // Source filter for the merged inbox. Defaults to 'all' so users see
+  // both sources unless they want to narrow down.
+  const [sourceFilter, setSourceFilter] = useState<'all' | 'bank' | 'skatteverket'>('all')
+
   const { toast } = useToast()
   const { dialogProps: deleteDialogProps, confirm: confirmDelete } = useDestructiveConfirm()
   const supabase = createClient()
@@ -139,6 +159,44 @@ export default function TransactionsPage() {
       if (aHasMatch !== bHasMatch) return bHasMatch - aHasMatch
       return b.date.localeCompare(a.date)
     })
+
+  // Merged inbox: bank tx + SKV rows interleaved by date. Source filter
+  // narrows to one side. SKV rows always go after bank rows on the same
+  // date — bank tx tend to have invoice-match suggestions and we'd rather
+  // surface those first.
+  type InboxItem =
+    | { source: 'bank'; date: string; data: TransactionWithInvoice }
+    | { source: 'skatteverket'; date: string; data: SkattekontoTransactionWithSuggestion }
+
+  const skvUnmatched = skvRows.filter(r => !r.journal_entry_id)
+
+  const bankToSkvHints = findBankSkvCounterparts({
+    bankRows: uncategorizedTransactions.map(t => ({ id: t.id, date: t.date, amount: t.amount })),
+    skvRows: skvUnmatched,
+  })
+
+  const inboxItems: InboxItem[] = (() => {
+    const items: InboxItem[] = []
+    if (sourceFilter !== 'skatteverket') {
+      for (const t of uncategorizedTransactions) {
+        items.push({ source: 'bank', date: t.date, data: t })
+      }
+    }
+    if (sourceFilter !== 'bank') {
+      // Inbox only shows SKV rows that need action (no verifikat yet).
+      for (const r of skvRows) {
+        if (r.journal_entry_id) continue
+        if (exitingIds.has(r.id)) continue
+        items.push({ source: 'skatteverket', date: r.transaktionsdatum, data: r })
+      }
+    }
+    return items.sort((a, b) => {
+      if (a.date !== b.date) return b.date.localeCompare(a.date)
+      // Same date → bank first so invoice-match cards lead.
+      if (a.source !== b.source) return a.source === 'bank' ? -1 : 1
+      return 0
+    })
+  })()
   const transactionsWithMatches = transactions.filter(
     (t) =>
       (t.potential_invoice && !t.invoice_id) ||
@@ -202,6 +260,30 @@ export default function TransactionsPage() {
     setTotalUncategorizedCount(uncatCount ?? 0)
     setHasMore(rows.length >= PAGE_SIZE)
     setIsLoading(false)
+
+    // Fire-and-forget: load SKV rows in parallel with the rest of the
+    // page. We don't block on this — if the extension is disabled or the
+    // user isn't connected the response is 503/401 and we just leave the
+    // SKV section empty.
+    void loadSkvRows()
+  }
+
+  async function loadSkvRows() {
+    try {
+      const res = await fetch('/api/extensions/ext/skatteverket/skattekonto/transaktioner')
+      if (!res.ok) {
+        setSkvRows([])
+        return
+      }
+      const json = await res.json()
+      const booked = (json.data?.booked ?? []) as SkattekontoTransactionWithSuggestion[]
+      // Keep all booked SKV rows in state — inbox view filters to obokförda
+      // (journal_entry_id null), history view shows all of them (matched
+      // and unmatched) interleaved with bank tx by date.
+      setSkvRows(booked)
+    } catch {
+      setSkvRows([])
+    }
   }
 
   async function loadMoreTransactions() {
@@ -690,6 +772,50 @@ export default function TransactionsPage() {
     }
   }
 
+  async function handleSkvBokfor(row: StoredSkattekontoTransaction) {
+    setSkvProcessingId(row.id)
+    try {
+      const res = await fetch(
+        `/api/extensions/ext/skatteverket/skattekonto/transaktioner/${row.id}/bokfor`,
+        { method: 'POST' },
+      )
+      const json = await res.json()
+      if (!res.ok) {
+        throw new Error(json.error || 'Bokföring misslyckades')
+      }
+      toast({
+        title: 'Utkast skapat',
+        description: 'Granska och bokför verifikatet i Bokföring.',
+      })
+      window.location.href = `/bookkeeping/${json.data.entry.id}`
+    } catch (err) {
+      toast({
+        title: 'Kunde inte bokföra',
+        description: err instanceof Error ? err.message : undefined,
+        variant: 'destructive',
+      })
+    } finally {
+      setSkvProcessingId(null)
+    }
+  }
+
+  function handleSkvMatched() {
+    // After a successful match, drop the row from the inbox — it's now
+    // linked to a verifikat. Trigger an exit animation first.
+    if (skvMatchTarget) {
+      const id = skvMatchTarget.id
+      setExitingIds(prev => new Set(prev).add(id))
+      setTimeout(() => {
+        setSkvRows(prev => prev.filter(r => r.id !== id))
+        setExitingIds(prev => {
+          const next = new Set(prev)
+          next.delete(id)
+          return next
+        })
+      }, 350)
+    }
+  }
+
   function handleTransactionBooked(transactionId: string, journalEntryId: string) {
     setExitingIds((prev) => new Set(prev).add(transactionId))
     setTimeout(() => {
@@ -939,42 +1065,99 @@ export default function TransactionsPage() {
           ))}
         </div>
       ) : mode === 'inbox' ? (
-        uncategorizedTransactions.length === 0 ? (
+        inboxItems.length === 0 ? (
           <InboxZeroState
-            hasTransactions={transactions.length > 0}
+            hasTransactions={transactions.length > 0 || skvRows.length > 0}
             onCreateTransaction={() => setIsDialogOpen(true)}
           />
         ) : (
           <div className="space-y-3">
+            {/* Source filter — only render when both sources have content
+                to filter between, otherwise it'd be a no-op chip row. */}
+            {skvUnmatched.length > 0 && uncategorizedTransactions.length > 0 && (
+              <div className="flex items-center gap-2 text-xs">
+                <span className="text-muted-foreground">Källa:</span>
+                <button
+                  onClick={() => setSourceFilter('all')}
+                  className={cn(
+                    'rounded-full border px-3 py-1 transition-colors',
+                    sourceFilter === 'all'
+                      ? 'border-foreground bg-foreground text-background'
+                      : 'border-border text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  Alla ({uncategorizedTransactions.length + skvUnmatched.length})
+                </button>
+                <button
+                  onClick={() => setSourceFilter('bank')}
+                  className={cn(
+                    'rounded-full border px-3 py-1 transition-colors',
+                    sourceFilter === 'bank'
+                      ? 'border-foreground bg-foreground text-background'
+                      : 'border-border text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  Bank ({uncategorizedTransactions.length})
+                </button>
+                <button
+                  onClick={() => setSourceFilter('skatteverket')}
+                  className={cn(
+                    'flex items-center gap-1 rounded-full border px-3 py-1 transition-colors',
+                    sourceFilter === 'skatteverket'
+                      ? 'border-foreground bg-foreground text-background'
+                      : 'border-border text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  <Landmark className="h-3 w-3" />
+                  Skatteverket ({skvUnmatched.length})
+                </button>
+              </div>
+            )}
             <AnimatePresence mode="popLayout">
-              {uncategorizedTransactions.map((transaction) => (
-                <TransactionInboxCard
-                  key={transaction.id}
-                  transaction={transaction}
-                  suggestions={categorySuggestions[transaction.id]}
-                  templateSuggestions={templateSuggestions[transaction.id]}
-                  processingId={processingId}
-                  isBatchMode={isBatchMode}
-                  isSelected={selectedIds.has(transaction.id)}
-                  entityType={entityType}
-                  onCategorize={handleCategorize}
-                  onMarkPrivate={handleMarkPrivate}
-                  onOpenMatchDialog={openMatchDialog}
-                  onOpenCategoryDialog={openCategoryDialog}
-                  onDelete={handleDeleteTransaction}
-                  onOpenQuickReview={handleOpenQuickReview}
-                  onOpenTemplateReview={handleOpenTemplateReview}
-                  onToggleSelect={toggleBatchSelect}
-                />
-              ))}
+              {inboxItems.map(item =>
+                item.source === 'bank' ? (
+                  <TransactionInboxCard
+                    key={`bank-${item.data.id}`}
+                    transaction={item.data}
+                    suggestions={categorySuggestions[item.data.id]}
+                    templateSuggestions={templateSuggestions[item.data.id]}
+                    skvCounterpartDate={bankToSkvHints.get(item.data.id)}
+                    processingId={processingId}
+                    isBatchMode={isBatchMode}
+                    isSelected={selectedIds.has(item.data.id)}
+                    entityType={entityType}
+                    onCategorize={handleCategorize}
+                    onMarkPrivate={handleMarkPrivate}
+                    onOpenMatchDialog={openMatchDialog}
+                    onOpenCategoryDialog={openCategoryDialog}
+                    onDelete={handleDeleteTransaction}
+                    onOpenQuickReview={handleOpenQuickReview}
+                    onOpenTemplateReview={handleOpenTemplateReview}
+                    onToggleSelect={toggleBatchSelect}
+                  />
+                ) : (
+                  <SkattekontoInboxCard
+                    key={`skv-${item.data.id}`}
+                    row={item.data}
+                    matchSuggestion={item.data.match_suggestion}
+                    processing={skvProcessingId === item.data.id}
+                    onBokfor={handleSkvBokfor}
+                    onMatch={r => setSkvMatchTarget(r)}
+                  />
+                ),
+              )}
             </AnimatePresence>
           </div>
         )
       ) : (
         <TransactionHistoryList
           transactions={transactions}
+          skvRows={skvRows}
           onOpenMatchDialog={openMatchDialog}
           onOpenCategoryDialog={openCategoryDialog}
+          onDelete={handleDeleteTransaction}
+          onSkvBokfor={handleSkvBokfor}
+          onSkvMatch={r => setSkvMatchTarget(r)}
           hasMore={hasMore}
           isLoadingMore={isLoadingMore}
           onLoadMore={loadMoreTransactions}
@@ -1150,6 +1333,13 @@ export default function TransactionsPage() {
       </Dialog>
 
       <DestructiveConfirmDialog {...deleteDialogProps} />
+
+      <SkattekontoMatchDialog
+        row={skvMatchTarget}
+        open={!!skvMatchTarget}
+        onClose={() => setSkvMatchTarget(null)}
+        onMatched={handleSkvMatched}
+      />
     </div>
   )
 }

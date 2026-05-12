@@ -299,23 +299,14 @@ export interface SkatteverketFel {
   felmeddelande: string
 }
 
-/** Row shape for the skattekonto_transactions table (DB → app) */
-export interface StoredSkattekontoTransaction {
-  id: string
-  company_id: string
-  transaktionsidentitet: number | null
-  dedup_key: string
-  transaktionsdatum: string
-  forfallodatum: string | null
-  ranteberakningsdatum: string | null
-  transaktionstext: string
-  belopp_skatteverket: number
-  belopp_kronofogden: number | null
-  status: 'booked' | 'upcoming'
-  journal_entry_id: string | null
-  imported_at: string
-  updated_at: string
-}
+// Re-exported from core because the table lives in core migrations and
+// the /transactions page (core) needs to render its rows. Extension-internal
+// code continues to import from this module for backwards compatibility.
+export type {
+  StoredSkattekontoTransaction,
+  SkattekontoMatchSuggestion,
+  SkattekontoTransactionWithSuggestion,
+} from '@/types/skatteverket'
 
 /** Cached snapshot stored in extension_data under key skattekonto_balance_snapshot */
 export interface SkattekontoBalanceSnapshot {
