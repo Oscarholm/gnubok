@@ -1,34 +1,73 @@
 'use client'
 
-import { useState } from 'react'
-import { useRouter } from 'next/navigation'
+import { useState, useEffect, Suspense } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
+import { createClient } from '@/lib/supabase/client'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useToast } from '@/components/ui/use-toast'
 import { Loader2, KeyRound } from 'lucide-react'
+import { userHasPassword } from '@/lib/auth/has-password'
+import { safeReturnTo } from '@/lib/auth/safe-return-to'
 
-export default function ResetPasswordPage() {
+export default function SetPasswordPage() {
+  return (
+    <Suspense>
+      <SetPasswordContent />
+    </Suspense>
+  )
+}
+
+function SetPasswordContent() {
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const { toast } = useToast()
   const router = useRouter()
+  const searchParams = useSearchParams()
+  const supabase = createClient()
 
-  const handleResetPassword = async (e: React.FormEvent<HTMLFormElement>) => {
+  const returnTo = safeReturnTo(searchParams.get('returnTo'), '/settings/account')
+
+  // Users who already have a password don't belong here — bounce them away.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser()
+      if (cancelled) return
+      if (!user) {
+        router.replace('/login')
+        return
+      }
+      if (userHasPassword(user)) {
+        router.replace(returnTo)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const handleSetPassword = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     setIsLoading(true)
 
-    const strong = password.length >= 8
-      && /[a-z]/.test(password)
-      && /[A-Z]/.test(password)
-      && /[0-9]/.test(password)
-      && /[^a-zA-Z0-9]/.test(password)
+    const strong =
+      password.length >= 8 &&
+      /[a-z]/.test(password) &&
+      /[A-Z]/.test(password) &&
+      /[0-9]/.test(password) &&
+      /[^a-zA-Z0-9]/.test(password)
 
     if (!strong) {
       toast({
         title: 'Lösenordet är för svagt',
-        description: 'Lösenordet måste vara minst 8 tecken och innehålla versaler, gemener, siffror och specialtecken.',
+        description:
+          'Lösenordet måste vara minst 8 tecken och innehålla versaler, gemener, siffror och specialtecken.',
         variant: 'destructive',
       })
       setIsLoading(false)
@@ -46,11 +85,6 @@ export default function ResetPasswordPage() {
     }
 
     try {
-      // Routed through the API so the has_password flag flips in lock-step
-      // with the password update. This is the unlock path for BankID-only
-      // users who enrolled MFA and got locked out — the recovery session
-      // bypasses AAL2, the API flips has_password, and the lockout banner
-      // disappears the next time they log in.
       const res = await fetch('/api/account/password', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -60,7 +94,7 @@ export default function ResetPasswordPage() {
       if (!res.ok) {
         const body = (await res.json().catch(() => ({}))) as { error?: string }
         toast({
-          title: 'Kunde inte uppdatera lösenord',
+          title: 'Kunde inte spara lösenord',
           description: body.error || 'Försök igen senare.',
           variant: 'destructive',
         })
@@ -68,11 +102,11 @@ export default function ResetPasswordPage() {
       }
 
       toast({
-        title: 'Lösenord uppdaterat',
-        description: 'Ditt lösenord har ändrats.',
+        title: 'Lösenord sparat',
+        description: 'Du kan nu aktivera tvåfaktorsautentisering.',
       })
 
-      router.push('/')
+      router.push(returnTo)
       router.refresh()
     } catch {
       toast({
@@ -86,24 +120,27 @@ export default function ResetPasswordPage() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-b from-background to-primary/[0.03] p-4">
+    <div className="min-h-screen flex flex-col items-center justify-center bg-background p-4">
       <div className="w-full max-w-sm animate-slide-up">
         <div className="text-center mb-10">
           <div className="flex justify-center mb-4">
-            <div className="h-14 w-14 rounded-2xl bg-primary/8 flex items-center justify-center">
+            <div className="h-14 w-14 rounded-lg bg-secondary flex items-center justify-center">
               <KeyRound className="h-7 w-7 text-primary" />
             </div>
           </div>
-          <h1 className="text-2xl font-medium tracking-tight">Nytt lösenord</h1>
+          <h1 className="font-display text-3xl tracking-tight">
+            Sätt ett lösenord
+          </h1>
           <p className="text-muted-foreground text-sm mt-2">
-            Ange ditt nya lösenord nedan
+            Du loggade in med BankID. För att aktivera tvåfaktorsautentisering
+            eller logga in med e-post behöver du först sätta ett lösenord.
           </p>
         </div>
 
-        <div className="rounded-xl border bg-card p-6" style={{ boxShadow: 'var(--shadow-md)' }}>
-          <form onSubmit={handleResetPassword} className="space-y-5">
+        <div className="rounded-lg border border-border bg-card p-6">
+          <form onSubmit={handleSetPassword} className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="password">Nytt lösenord</Label>
+              <Label htmlFor="password">Lösenord</Label>
               <Input
                 id="password"
                 type="password"
@@ -139,7 +176,7 @@ export default function ResetPasswordPage() {
                   Sparar...
                 </>
               ) : (
-                'Spara nytt lösenord'
+                'Spara lösenord'
               )}
             </Button>
           </form>
