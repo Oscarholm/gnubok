@@ -167,6 +167,13 @@ interface StageOptions {
   dateForPeriodCheck?: string
 }
 
+function buildApprovalGuidance(operationId: string, riskLevel: 'low' | 'medium' | 'high'): string {
+  if (riskLevel === 'high') {
+    return `This is an irreversible posting under BFL 5 kap 5§ — surface the irreversibility implications to the user and obtain an explicit acknowledgment before committing. Once the user has acknowledged, call gnubok_approve_pending_operation with operation_id="${operationId}" and confirmed=true.`
+  }
+  return `When the user authorises, call gnubok_approve_pending_operation with operation_id="${operationId}".`
+}
+
 async function stagePendingOperation(
   supabase: SupabaseClient,
   companyId: string,
@@ -186,6 +193,7 @@ async function stagePendingOperation(
   risk_level: 'low' | 'medium' | 'high'
   actor: ActorContext
   message: string
+  approve?: { tool: string; args: Record<string, unknown> }
   preview: Record<string, unknown>
   period_status?: PeriodStatusForDate
   next?: StageNextHint
@@ -238,12 +246,19 @@ async function stagePendingOperation(
   if (options.idempotencyKey && requestHash) {
     const cached = await checkIdempotencyKey(supabase, userId, companyId, options.idempotencyKey, requestHash)
     if (cached) {
+      const cachedBody = cached.body as Record<string, unknown>
+      const cachedOpId = typeof cachedBody.operation_id === 'string' ? cachedBody.operation_id : undefined
       return {
-        ...(cached.body as Record<string, unknown>),
+        ...cachedBody,
         idempotency_replay: true,
         risk_level: riskLevel,
         actor,
-        message: `Replayed cached response for idempotency_key "${options.idempotencyKey}". No new side-effects.`,
+        message: cachedOpId
+          ? `Replayed cached response for idempotency_key "${options.idempotencyKey}" — already staged as pending_operation ${cachedOpId}. No new side-effects. ${buildApprovalGuidance(cachedOpId, riskLevel)}`
+          : `Replayed cached response for idempotency_key "${options.idempotencyKey}". No new side-effects.`,
+        ...(cachedOpId
+          ? { approve: { tool: 'gnubok_approve_pending_operation', args: { operation_id: cachedOpId } } }
+          : {}),
         preview: periodStatus ? { ...previewData, period_status: periodStatus } : previewData,
         ...(periodStatus ? { period_status: periodStatus } : {}),
       } as Awaited<ReturnType<typeof stagePendingOperation>>
@@ -269,12 +284,22 @@ async function stagePendingOperation(
 
   if (error) throw new Error(`Failed to stage operation: ${error.message}`)
 
+  // approve.args carries only the operation_id. For high-risk operations the
+  // LLM must supply confirmed=true itself after surfacing the BFL 5 kap 5§
+  // irreversibility implications to the user — pre-filling it server-side
+  // would collapse the explicit-acknowledgment gate (mirrors the web UI's
+  // warning dialog). The server-side check in gnubok_approve_pending_operation
+  // remains authoritative.
   const response = {
     staged: true,
     operation_id: data.id,
     risk_level: riskLevel,
     actor,
-    message: `Operation staged for review (risk: ${riskLevel}). Open the ${branding} web app to approve or reject it.`,
+    message: `Staged as pending_operation ${data.id} (risk: ${riskLevel}). ${buildApprovalGuidance(data.id, riskLevel)} The user can also approve at /pending in the ${branding} web app.`,
+    approve: {
+      tool: 'gnubok_approve_pending_operation',
+      args: { operation_id: data.id } as Record<string, unknown>,
+    },
     preview: periodStatus ? { ...previewData, period_status: periodStatus } : previewData,
     ...(periodStatus ? { period_status: periodStatus } : {}),
     ...(next ? { next } : {}),
@@ -591,6 +616,7 @@ const STAGED_OPERATION_SCHEMA = {
     dry_run: { type: 'boolean' },
     idempotency_replay: { type: 'boolean' },
     message: { type: 'string' },
+    approve: { type: 'object' },
     preview: { type: 'object' },
     period_status: {
       type: 'object',
@@ -1435,7 +1461,7 @@ export const tools: McpTool[] = [
 
   {
     name: 'gnubok_create_transactions',
-    description: 'Stage one or more transactions for the user to approve. Each item creates a separate pending operation that the user confirms or rejects in the web app. Useful for ingesting rows from external sources (Airtable, CSVs, etc.). Max 10 per call.',
+    description: 'Stage one or more transactions for the user to approve. Each item creates a separate pending operation; commit each via gnubok_approve_pending_operation when the user authorises. Useful for ingesting rows from external sources (Airtable, CSVs, etc.). Max 10 per call.',
     outputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1696,7 +1722,7 @@ export const tools: McpTool[] = [
 
   {
     name: 'gnubok_categorize_transaction',
-    description: 'Categorize a bank transaction. Stages the journal entry for the user to approve in the web app — no DB write until approval.',
+    description: 'Categorize a bank transaction. Stages the journal entry; commit via gnubok_approve_pending_operation when the user authorises — no DB write until approval.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1723,7 +1749,7 @@ export const tools: McpTool[] = [
         userId,
         companyId,
         supabase,
-        false // preview mode — execution happens via web UI commit
+        false // preview mode — execution happens at approval time via gnubok_approve_pending_operation
       )
 
       // If already has a journal entry, pass through as-is
@@ -6535,7 +6561,7 @@ export const tools: McpTool[] = [
 
   {
     name: 'gnubok_approve_pending_operation',
-    description: "Commit a staged pending_operation. This IS the chat-approval action — call when the user authorises an operation_id in chat ('approve', 'book it', 'go ahead'). Staging already gated review; do not redirect to the web UI. risk_level=high needs confirmed=true (BFL 5 kap 5§).",
+    description: "Commit a staged pending_operation when the user has explicitly authorised the operation_id. risk_level=high requires confirmed=true — surface the BFL 5 kap 5§ irreversibility to the user first. The /pending web UI offers an equivalent commit path.",
     inputSchema: {
       type: 'object',
       additionalProperties: false,
