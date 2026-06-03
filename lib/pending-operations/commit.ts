@@ -40,6 +40,7 @@ import {
   createSupplierInvoiceRegistrationEntry,
 } from '@/lib/bookkeeping/supplier-invoice-entries'
 import { linkInvoiceToVoucher } from '@/lib/invoices/voucher-matching'
+import { planInvoicePayment } from '@/lib/invoices/apply-invoice-payment'
 import { linkSupplierInvoiceToVoucher } from '@/lib/invoices/supplier-voucher-matching'
 import { linkTransactionToJournalEntry } from '@/lib/transactions/link-journal-entry'
 import { getErrorEntry } from '@/lib/errors/structured-errors'
@@ -899,18 +900,29 @@ async function commitMatchTransactionInvoice(
     return { error: 'Invoice is not in a matchable state', status: 409 }
   }
 
+  // Overshoot guard + paid/remaining math — shared with the dashboard and v1
+  // routes via planInvoicePayment. This agent/MCP path previously had NO guard,
+  // so a 1500 payment on a 1000 invoice was silently accepted (paid_amount >
+  // total, AR over-credited). Runs BEFORE the storno + JE below, so a rejected
+  // match leaves the transaction untouched and never burns a voucher number.
+  const paidAmount = transaction.amount
+  const payment = planInvoicePayment(invoice, paidAmount)
+  if (!payment.ok) {
+    return {
+      error:
+        getErrorEntry('MATCH_AMOUNT_EXCEEDS_REMAINING')?.message_sv ??
+        'Transaktionsbeloppet är större än fakturans återstående belopp.',
+      status: 400,
+    }
+  }
+  const { newPaidAmount, newRemaining, isFullyPaid, newStatus } = payment.plan
+
   if (transaction.journal_entry_id) {
     await reverseEntry(supabase, companyId, userId, transaction.journal_entry_id)
     await supabase.from('transactions').update({ journal_entry_id: null }).eq('id', transactionId)
   }
 
   const now = new Date().toISOString()
-  const paidAmount = transaction.amount
-  const newPaidAmount = Math.round(((invoice.paid_amount || 0) + paidAmount) * 100) / 100
-  const currentRemaining = invoice.remaining_amount ?? (invoice.total - (invoice.paid_amount || 0))
-  const newRemaining = Math.max(0, Math.round((currentRemaining - paidAmount) * 100) / 100)
-  const isFullyPaid = newRemaining <= 0
-  const newStatus = isFullyPaid ? 'paid' : 'partially_paid'
 
   const { data: settings } = await supabase
     .from('company_settings').select('accounting_method, entity_type').eq('company_id', companyId).single()
