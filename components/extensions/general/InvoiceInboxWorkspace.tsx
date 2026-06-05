@@ -1630,12 +1630,15 @@ function FieldsRail({
         ) : (
           <>
             {/* Unmatched state: the canonical next step is to find the bank
-                transaction this underlag belongs to. "Bokför manuellt" opens
-                BookDirectlyDialog without a transaction — for underlag with
-                no bank movement (cash expenses, private outlays); the dialog
-                still offers optional transaction selection inside. "Skapa
-                leverantörsfaktura" stays as an escape hatch for users who
-                want supplier-invoice tracking (accrual flow). */}
+                transaction this underlag belongs to. Two escape hatches sit
+                below it — "Skapa leverantörsfaktura" for users who want
+                supplier-invoice tracking (accrual flow), and "Bokför som
+                verifikat" for underlag that aren't a supplier invoice at all
+                (bank fees, owner expenses, the underlag for a correction). The
+                latter opens the same BookDirectlyDialog as the matched state,
+                which works without a bank transaction and lets the user attach
+                one if they want. Per BFL 5 kap 6-7 § the underlag must be
+                bookable as a verifikat, not forced into a supplier invoice. */}
             <Button
               variant="default"
               size="sm"
@@ -1644,19 +1647,19 @@ function FieldsRail({
             >
               Matcha mot transaktion
             </Button>
+            <Link href={`/supplier-invoices/new?inbox_item_id=${item.id}`} className="block">
+              <Button variant="outline" size="sm" className="w-full">
+                Skapa leverantörsfaktura
+              </Button>
+            </Link>
             <Button
               variant="outline"
               size="sm"
               className="w-full"
               onClick={onBookDirect}
             >
-              Bokför manuellt
+              Bokför som verifikat
             </Button>
-            <Link href={`/supplier-invoices/new?inbox_item_id=${item.id}`} className="block">
-              <Button variant="outline" size="sm" className="w-full">
-                Skapa leverantörsfaktura
-              </Button>
-            </Link>
           </>
         )}
         <Button

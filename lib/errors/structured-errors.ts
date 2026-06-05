@@ -738,6 +738,21 @@ const INVOICE: Record<string, StructuredErrorEntry> = {
     message_sv: 'Fakturan ändrades samtidigt och kunde inte makuleras. Ladda om och försök igen.',
     message_en: 'Invoice was modified concurrently and could not be cancelled. Reload and retry.',
   },
+  INVOICE_NOT_FOUND: {
+    httpStatus: 404,
+    message_sv: 'Fakturan kunde inte hittas.',
+    message_en: 'Invoice not found.',
+  },
+  INVOICE_FINALIZE_NOT_DRAFT: {
+    httpStatus: 409,
+    message_sv: 'Endast onumrerade utkast kan skapas. Fakturan har redan ett nummer eller är inte ett utkast.',
+    message_en: 'Only unnumbered drafts can be finalized; this invoice already has a number or is not a draft.',
+  },
+  INVOICE_FINALIZE_INCOMPLETE: {
+    httpStatus: 500,
+    message_sv: 'Fakturanumret tilldelades men fakturan kunde inte läsas tillbaka. Ladda om sidan och kontrollera fakturan.',
+    message_en: 'The invoice number was assigned but the invoice could not be re-read. Reload the page and verify the invoice.',
+  },
   // Quotes / Offerter
   QUOTE_NOT_FOUND: {
     httpStatus: 404,
@@ -832,6 +847,20 @@ const PERIOD: Record<string, StructuredErrorEntry> = {
     httpStatus: 409,
     message_sv: 'Perioden är redan låst.',
     message_en: 'Period is already locked.',
+  },
+  // Forward-chaining a new räkenskapsår is blocked while a prior period is
+  // still fully open (not locked, not closed, not covered by the company-wide
+  // lock-through date). BFL 6 kap allows löpande bokföring of the new year in
+  // parallel with bokslut, but the prior year must at least be locked so
+  // nothing is back-posted into a year you've moved on from. The blocking
+  // periods (id + name + dates) are attached to the response `details` so the
+  // UI can offer to lock them inline. See app/api/bookkeeping/fiscal-periods.
+  PERIOD_CREATE_BLOCKED_BY_OPEN_PERIODS: {
+    httpStatus: 409,
+    message_sv:
+      'Du måste låsa föregående räkenskapsår innan du kan skapa ett nytt.',
+    message_en:
+      'Cannot create a new fiscal year while a prior period is still open; lock it first.',
   },
 }
 
